@@ -519,11 +519,14 @@ pub async fn run_translate(app: AppHandle, run_id: String, req: RunRequest, abor
                         key_note: "差分なし（既存再利用）".to_string(),
                     },
                 );
+                let elapsed_ms = task_start.elapsed().as_millis();
+                let mins = elapsed_ms / 1000 / 60;
+                let secs = (elapsed_ms / 1000) % 60;
                 let _ = app.emit(
                     "modtranslate:log",
                     LogEvent {
                         run_id: run_id.clone(),
-                        line: format!("SKIP {} ({}ms)", current_label, task_start.elapsed().as_millis()),
+                        line: format!("SKIP {} ({}m{}s | {}ms)", current_label, mins, secs, elapsed_ms),
                     },
                 );
                 continue;
@@ -660,11 +663,14 @@ pub async fn run_translate(app: AppHandle, run_id: String, req: RunRequest, abor
                             key_note: "書き込み完了".to_string(),
                         },
                     );
+                    let elapsed_ms = task_start.elapsed().as_millis();
+                    let mins = elapsed_ms / 1000 / 60;
+                    let secs = (elapsed_ms / 1000) % 60;
                     let _ = app.emit(
                         "modtranslate:log",
                         LogEvent {
                             run_id: run_id.clone(),
-                            line: format!("OK   {} ({}ms)", current_label, task_start.elapsed().as_millis()),
+                            line: format!("OK   {} ({}m{}s | {}ms)", current_label, mins, secs, elapsed_ms),
                         },
                     );
                 }

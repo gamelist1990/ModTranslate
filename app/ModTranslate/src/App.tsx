@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from '@tauri-apps/api/core';
 import { listen } from "@tauri-apps/api/event";
 import { message, open as openDialog } from "@tauri-apps/plugin-dialog";
 import { openPath } from "@tauri-apps/plugin-opener";
@@ -92,6 +92,7 @@ function App() {
     (async () => {
       try {
         const langs = await invoke<string[]>("get_common_langs");
+        console.log("common langs:", langs);
         setCommonLangs(langs);
       } catch {
         setCommonLangs(["en_us", "ja_jp"]);

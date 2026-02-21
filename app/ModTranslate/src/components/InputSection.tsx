@@ -68,27 +68,105 @@ export const InputSection: React.FC<InputSectionProps> = ({
       <div className="two">
         <div className="field">
           <label>翻訳元（Minecraft言語）</label>
-          <input
-            list="langs"
-            value={source}
-            onChange={(e) => setSource(e.currentTarget.value)}
-            disabled={busy || isRunning}
-          />
+          {commonLangs && commonLangs.length > 0 ? (
+            (() => {
+              const isCustom = !commonLangs.includes(source);
+              return (
+                <>
+                  <select
+                    value={isCustom ? "__custom__" : source}
+                    onChange={(e) => {
+                      const v = e.currentTarget.value;
+                      if (v === "__custom__") {
+                        // keep current source (possibly custom) and show input
+                        if (!commonLangs.includes(source)) return;
+                        setSource("");
+                      } else {
+                        setSource(v);
+                      }
+                    }}
+                    disabled={busy || isRunning}
+                  >
+                    <option value="" disabled>
+                      -- 選択してください --
+                    </option>
+                    {commonLangs.map((l) => (
+                      <option value={l} key={l}>
+                        {l}
+                      </option>
+                    ))}
+                    <option value="__custom__">その他（手動入力）</option>
+                  </select>
+                  {isCustom ? (
+                    <input
+                      value={source}
+                      onChange={(e) => setSource(e.currentTarget.value)}
+                      placeholder="例: en_us"
+                      disabled={busy || isRunning}
+                    />
+                  ) : null}
+                </>
+              );
+            })()
+          ) : (
+            <input
+              list="langs"
+              value={source}
+              onChange={(e) => setSource(e.currentTarget.value)}
+              disabled={busy || isRunning}
+            />
+          )}
         </div>
         <div className="field">
           <label>翻訳先（Minecraft言語）</label>
-          <input
-            list="langs"
-            value={target}
-            onChange={(e) => setTarget(e.currentTarget.value)}
-            disabled={busy || isRunning}
-          />
+          {commonLangs && commonLangs.length > 0 ? (
+            (() => {
+              const isCustom = !commonLangs.includes(target);
+              return (
+                <>
+                  <select
+                    value={isCustom ? "__custom__" : target}
+                    onChange={(e) => {
+                      const v = e.currentTarget.value;
+                      if (v === "__custom__") {
+                        if (!commonLangs.includes(target)) return;
+                        setTarget("");
+                      } else {
+                        setTarget(v);
+                      }
+                    }}
+                    disabled={busy || isRunning}
+                  >
+                    <option value="" disabled>
+                      -- 選択してください --
+                    </option>
+                    {commonLangs.map((l) => (
+                      <option value={l} key={l}>
+                        {l}
+                      </option>
+                    ))}
+                    <option value="__custom__">その他（手動入力）</option>
+                  </select>
+                  {isCustom ? (
+                    <input
+                      value={target}
+                      onChange={(e) => setTarget(e.currentTarget.value)}
+                      placeholder="例: ja_jp"
+                      disabled={busy || isRunning}
+                    />
+                  ) : null}
+                </>
+              );
+            })()
+          ) : (
+            <input
+              list="langs"
+              value={target}
+              onChange={(e) => setTarget(e.currentTarget.value)}
+              disabled={busy || isRunning}
+            />
+          )}
         </div>
-        <datalist id="langs">
-          {commonLangs.map((l) => (
-            <option value={l} key={l} />
-          ))}
-        </datalist>
       </div>
     </section>
   );
