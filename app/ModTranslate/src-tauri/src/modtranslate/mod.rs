@@ -42,7 +42,7 @@ pub struct PlanResult {
 pub struct TranslateConfig {
     pub provider: Option<String>,
     pub google_api_key: Option<String>,
-    pub gas_url: Option<String>,
+    pub deepl_api_key: Option<String>,
     pub concurrency: Option<u32>,
 }
 

@@ -16,6 +16,7 @@ pub enum Provider {
     Free,
     GoogleCloud,
     Gas,
+    DeepL,
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -28,6 +29,8 @@ pub enum TranslateError {
     RetryFailed { label: String, cause: String },
     #[error("GOOGLE_TRANSLATE_API_KEY is not set")]
     MissingApiKey,
+    #[error("DEEPL_API_KEY is not set")]
+    MissingDeepLKey,
     #[error("Aborted")]
     Aborted,
 }
@@ -41,6 +44,22 @@ fn to_google_lang(mc_lang: &str) -> String {
     let stem = mc_lang.trim().trim_end_matches(".json").to_lowercase();
     let parts: Vec<&str> = stem.split('_').collect();
     parts.first().copied().unwrap_or(stem.as_str()).to_string()
+}
+
+fn to_deepl_lang(mc_lang: &str) -> String {
+    let stem = mc_lang.trim().trim_end_matches(".json").to_lowercase();
+    let parts: Vec<&str> = stem.split('_').collect();
+    let primary = parts.first().copied().unwrap_or(stem.as_str());
+    let secondary = parts.get(1).copied();
+
+    match (primary, secondary) {
+        ("zh", _) => "ZH".to_string(),
+        ("en", Some("us")) => "EN-US".to_string(),
+        ("en", Some("gb")) => "EN-GB".to_string(),
+        ("pt", Some("br")) => "PT-BR".to_string(),
+        (p, Some(s)) if matches!(p, "en" | "pt") => format!("{}-{}", p.to_uppercase(), s.to_uppercase()),
+        (p, _) => p.to_uppercase(),
+    }
 }
 
 const DEFAULT_GAS_URL: &str = "https://script.google.com/macros/s/AKfycbxPh_IjkSYpkfxHoGXVzK4oNQ2Vy0uRByGeNGA6ti3M7flAMCYkeJKuoBrALNCMImEi_g/exec";
@@ -255,6 +274,68 @@ async fn translate_via_gas(text: &str, source: &str, target: &str, gas_url: &str
     Ok(translated)
 }
 
+#[derive(Debug, Deserialize)]
+struct DeepLTranslation {
+    text: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeepLResp {
+    translations: Vec<DeepLTranslation>,
+}
+
+async fn translate_deepl(text: &str, source: &str, target: &str, api_key: &str) -> Result<String, TranslateError> {
+    let key = api_key.trim();
+    if key.is_empty() {
+        return Err(TranslateError::MissingDeepLKey);
+    }
+
+    let endpoint = if key.ends_with(":fx") {
+        "https://api-free.deepl.com/v2/translate"
+    } else {
+        "https://api.deepl.com/v2/translate"
+    };
+
+    let body = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("auth_key", key)
+        .append_pair("text", text)
+        .append_pair("source_lang", source)
+        .append_pair("target_lang", target)
+        .finish();
+
+    let client = reqwest::Client::new();
+    let res = client
+        .post(endpoint)
+        .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(body)
+        .timeout(Duration::from_secs(20))
+        .send()
+        .await
+        .map_err(|e| TranslateError::Request(e.to_string()))?;
+
+    if !res.status().is_success() {
+        let status_code = res.status().as_u16();
+        let status_text = res.status().to_string();
+        let msg = res.text().await.unwrap_or(status_text);
+        return Err(TranslateError::Http {
+            status: status_code,
+            message: msg,
+        });
+    }
+
+    let data: DeepLResp = res
+        .json()
+        .await
+        .map_err(|e| TranslateError::Request(e.to_string()))?;
+
+    let translated = data
+        .translations
+        .get(0)
+        .map(|t| t.text.clone())
+        .unwrap_or_else(|| text.to_string());
+    Ok(translated)
+}
+
 fn protect_placeholders(input: &str) -> (String, Vec<(String, String)>) {
     static PATTERNS: std::sync::OnceLock<Vec<Regex>> = std::sync::OnceLock::new();
     let patterns = PATTERNS.get_or_init(|| {
@@ -298,11 +379,14 @@ fn restore_placeholders(translated: &str, repls: &[(String, String)]) -> String 
 
 #[derive(Clone)]
 pub struct Translator {
-    source: String,
-    target: String,
+    source_google: String,
+    target_google: String,
+    source_deepl: String,
+    target_deepl: String,
     provider_primary: Provider,
     has_cloud: bool,
     api_key: Option<String>,
+    deepl_api_key: Option<String>,
     gas_url: String,
     semaphore: Arc<Semaphore>,
     cache: Arc<Mutex<HashMap<String, String>>>,
@@ -314,13 +398,16 @@ impl Translator {
         match self.provider_primary {
             Provider::GoogleCloud => "google-cloud",
             Provider::Gas => "gas",
+            Provider::DeepL => "deepl",
             Provider::Free => "free",
         }
     }
 
     pub fn new(source_mc: &str, target_mc: &str, cfg: &TranslateConfig) -> Self {
-        let source = to_google_lang(source_mc);
-        let target = to_google_lang(target_mc);
+        let source_google = to_google_lang(source_mc);
+        let target_google = to_google_lang(target_mc);
+        let source_deepl = to_deepl_lang(source_mc);
+        let target_deepl = to_deepl_lang(target_mc);
 
         let api_key = cfg
             .google_api_key
@@ -329,10 +416,17 @@ impl Translator {
             .filter(|s| !s.is_empty());
         let has_cloud = api_key.is_some();
 
+        let deepl_api_key = cfg
+            .deepl_api_key
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
         let provider_str = cfg.provider.as_ref().map(|s| s.to_lowercase());
         let provider_primary = match provider_str.as_deref() {
             Some("google-cloud") => Provider::GoogleCloud,
             Some("gas") => Provider::Gas,
+            Some("deepl") => Provider::DeepL,
             Some("free") => Provider::Free,
             // auto
             _ => {
@@ -347,19 +441,17 @@ impl Translator {
         let conc_default = if provider_primary == Provider::GoogleCloud { 4 } else { 3 };
         let concurrency = clamp_u32(cfg.concurrency, 1, 32, conc_default);
 
-        let gas_url = cfg
-            .gas_url
-            .as_ref()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| DEFAULT_GAS_URL.to_string());
+        let gas_url = DEFAULT_GAS_URL.to_string();
 
         Self {
-            source,
-            target,
+            source_google,
+            target_google,
+            source_deepl,
+            target_deepl,
             provider_primary,
             has_cloud,
             api_key,
+            deepl_api_key,
             gas_url,
             semaphore: Arc::new(Semaphore::new(concurrency as usize)),
             cache: Arc::new(Mutex::new(HashMap::new())),
@@ -398,12 +490,16 @@ impl Translator {
                     }
                     tokio::time::sleep(Duration::from_millis(60)).await;
 
-                    let try_free = || with_retry(|| translate_free(&t, &this.source, &this.target), "free");
+                    let try_free = || with_retry(|| translate_free(&t, &this.source_google, &this.target_google), "free");
                     let try_cloud = || async {
                         let key = this.api_key.as_deref().ok_or(TranslateError::MissingApiKey)?;
-                        with_retry(|| translate_google_cloud(&t, &this.source, &this.target, key), "google-cloud").await
+                        with_retry(|| translate_google_cloud(&t, &this.source_google, &this.target_google, key), "google-cloud").await
                     };
-                    let try_gas = || with_retry(|| translate_via_gas(&t, &this.source, &this.target, &this.gas_url), "gas");
+                    let try_gas = || with_retry(|| translate_via_gas(&t, &this.source_google, &this.target_google, &this.gas_url), "gas");
+                    let try_deepl = || async {
+                        let key = this.deepl_api_key.as_deref().ok_or(TranslateError::MissingDeepLKey)?;
+                        with_retry(|| translate_deepl(&t, &this.source_deepl, &this.target_deepl, key), "deepl").await
+                    };
                                     // Decide sequence based on selected primary provider
                                     let translated = match this.provider_primary {
                                         Provider::GoogleCloud => {
@@ -456,6 +552,26 @@ impl Translator {
                                                         }
                                                     } else {
                                                         try_free().await?
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Provider::DeepL => {
+                                            match try_deepl().await {
+                                                Ok(v) => v,
+                                                Err(_e1) => {
+                                                    match try_gas().await {
+                                                        Ok(v) => v,
+                                                        Err(_e2) => {
+                                                            if this.has_cloud {
+                                                                match try_cloud().await {
+                                                                    Ok(v) => v,
+                                                                    Err(_e3) => { try_free().await? }
+                                                                }
+                                                            } else {
+                                                                try_free().await?
+                                                            }
+                                                        }
                                                     }
                                                 }
                                             }

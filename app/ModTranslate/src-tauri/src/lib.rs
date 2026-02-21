@@ -5,6 +5,7 @@ use tauri::Manager;
 use tokio_util::sync::CancellationToken;
 
 mod modtranslate;
+mod configure;
 
 const COMMON_MC_LANGS: &[&str] = &[
     "en_us", "en_gb", "ja_jp", "ko_kr", "zh_cn", "zh_tw", "fr_fr", "de_de", "es_es", "pt_br", "it_it",
@@ -48,6 +49,17 @@ fn get_common_langs() -> Vec<String> {
     COMMON_MC_LANGS.iter().map(|s| s.to_string()).collect()
 }
 
+// expose configure commands
+#[tauri::command]
+fn load_config() -> Result<Option<configure::UiConfig>, String> {
+    configure::load_config()
+}
+
+#[tauri::command]
+fn save_config(cfg: configure::UiConfig) -> Result<(), String> {
+    configure::save_config(cfg)
+}
+
 #[tauri::command]
 fn list_jars(dir: String) -> Result<Vec<modtranslate::JarFile>, String> {
     modtranslate::core::list_jar_files(&dir).map_err(|e| e.to_string())
@@ -87,7 +99,7 @@ pub fn run() {
         .manage(RunManager::new())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![get_common_langs, list_jars, scan_plan, start_run, cancel_run])
+        .invoke_handler(tauri::generate_handler![get_common_langs, list_jars, scan_plan, start_run, cancel_run, load_config, save_config])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

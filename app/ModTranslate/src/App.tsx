@@ -36,10 +36,44 @@ function App() {
   const [repairBrokenTargetInJar, setRepairBrokenTargetInJar] = useState(false);
   const [backupJars, setBackupJars] = useState(true);
 
-  const [provider, setProvider] = useState<"auto" | "free" | "google-cloud" | "gas">("auto");
+  const [provider, setProvider] = useState<"auto" | "free" | "google-cloud" | "gas" | "deepl">("auto");
   const [googleApiKey, setGoogleApiKey] = useState<string>("");
-  const [gasUrl, setGasUrl] = useState<string>("");
+  const [deeplApiKey, setDeeplApiKey] = useState<string>("");
   const [concurrency, setConcurrency] = useState<number>(0);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await invoke<any>("load_config");
+        if (res) {
+          const p = res.provider;
+          if (p === "auto" || p === "free" || p === "google-cloud" || p === "gas" || p === "deepl") setProvider(p);
+          if (typeof res.googleApiKey === "string") setGoogleApiKey(res.googleApiKey);
+          if (typeof res.deeplApiKey === "string") setDeeplApiKey(res.deeplApiKey);
+          if (typeof res.concurrency === "number") setConcurrency(res.concurrency);
+        }
+      } catch {
+        // ignore
+      }
+    })();
+  }, []);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        await invoke("save_config", {
+          cfg: {
+            provider: provider === "auto" ? null : provider,
+            googleApiKey: googleApiKey || null,
+            deeplApiKey: deeplApiKey || null,
+            concurrency: concurrency > 0 ? clampInt(concurrency, 1, 32) : null,
+          },
+        });
+      } catch {
+        // ignore
+      }
+    })();
+  }, [provider, googleApiKey, deeplApiKey, concurrency]);
 
   const [jarFiles, setJarFiles] = useState<JarFile[]>([]);
   const [selectedJars, setSelectedJars] = useState<string[]>([]);
@@ -69,7 +103,7 @@ function App() {
       translate: {
         provider: provider === "auto" ? null : provider,
         googleApiKey: googleApiKey || null,
-        gasUrl: gasUrl || null,
+        deeplApiKey: deeplApiKey || null,
         concurrency: concurrency > 0 ? clampInt(concurrency, 1, 32) : null,
       },
     }),
@@ -83,7 +117,7 @@ function App() {
       backupJars,
       provider,
       googleApiKey,
-      gasUrl,
+      deeplApiKey,
       concurrency,
     ],
   );
@@ -338,8 +372,8 @@ function App() {
           setConcurrency={setConcurrency}
           googleApiKey={googleApiKey}
           setGoogleApiKey={setGoogleApiKey}
-          gasUrl={gasUrl}
-          setGasUrl={setGasUrl}
+          deeplApiKey={deeplApiKey}
+          setDeeplApiKey={setDeeplApiKey}
           busy={busy}
           isRunning={isRunning}
         />
