@@ -1,0 +1,31 @@
+{
+  "name": "modtranslate",
+  "version": "0.1.0",
+  "module": "src/loader.ts",
+  "type": "module",
+  "scripts": {
+    "start": "bun src/loader.ts",
+    "build:exe": "node -e \"require('fs').mkdirSync('build',{recursive:true})\" && bun build --compile src/loader.ts --outfile build/ModTranslate",
+    "check:json": "bun scripts/JsonCheck.ts"
+  },
+  "private": true,
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/cli-progress": "^3.11.6",
+    "@types/inquirer": "^9.0.9",
+    "@types/node": "^25.3.0"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "chalk": "^5.6.2",
+    "cli-progress": "^3.12.0",
+    "cli-table3": "^0.6.5",
+    "inquirer": "^13.2.5",
+    "jszip": "^3.10.1",
+    "log-update": "^6.1.0",
+    "string-width": "^7.2.0",
+    "strip-ansi": "^7.1.0"
+  }
+}

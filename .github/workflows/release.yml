@@ -1,0 +1,109 @@
+name: Build and Release ModTranslate
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Confirm bun version
+        run: bun --version
+
+      - name: Cache bun
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.bun
+            node_modules
+          key: ${{ runner.os }}-bun-${{ hashFiles('bun.lock', 'package.json') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Determine version
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Prefer tag version (v1.2.3). Fallback to package.json version.
+          ref="${GITHUB_REF_NAME}"
+          if [[ "$ref" == v* ]]; then
+            version="${ref#v}"
+          else
+            version=$(node -p "require('./package.json').version || ''")
+          fi
+          if [[ -z "$version" ]]; then
+            echo "Version not found. Push a tag like v0.1.0 or set package.json version." >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Build native binaries (multi-platform)
+        shell: bash
+        run: |
+          set -euo pipefail
+          version='${{ steps.meta.outputs.version }}'
+          mkdir -p build
+          # Linux x64
+          bun build --compile --target=bun-linux-x64 src/loader.ts --outfile build/ModTranslate-${version}-linux-x64
+          # Linux arm64
+          bun build --compile --target=bun-linux-arm64 src/loader.ts --outfile build/ModTranslate-${version}-linux-arm64
+          # Windows x64
+          bun build --compile --target=bun-windows-x64 src/loader.ts --outfile build/ModTranslate-${version}-windows-x64.exe
+          # macOS arm64
+          bun build --compile --target=bun-darwin-arm64 src/loader.ts --outfile build/ModTranslate-${version}-darwin-arm64
+
+          # --- JsonCheck ---
+          # Linux x64
+          bun build --compile --target=bun-linux-x64 scripts/JsonCheck.ts --outfile build/JsonCheck-${version}-linux-x64
+          # Linux arm64
+          bun build --compile --target=bun-linux-arm64 scripts/JsonCheck.ts --outfile build/JsonCheck-${version}-linux-arm64
+          # Windows x64
+          bun build --compile --target=bun-windows-x64 scripts/JsonCheck.ts --outfile build/JsonCheck-${version}-windows-x64.exe
+          # macOS arm64
+          bun build --compile --target=bun-darwin-arm64 scripts/JsonCheck.ts --outfile build/JsonCheck-${version}-darwin-arm64
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: modtranslate-binaries
+          path: build/*
+
+      - name: Create GitHub Release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ModTranslate ${{ steps.meta.outputs.version }}
+          generate_release_notes: true
+          files: |
+            build/ModTranslate-${{ steps.meta.outputs.version }}-linux-x64
+            build/ModTranslate-${{ steps.meta.outputs.version }}-linux-arm64
+            build/ModTranslate-${{ steps.meta.outputs.version }}-windows-x64.exe
+            build/ModTranslate-${{ steps.meta.outputs.version }}-darwin-arm64
+            build/JsonCheck-${{ steps.meta.outputs.version }}-linux-x64
+            build/JsonCheck-${{ steps.meta.outputs.version }}-linux-arm64
+            build/JsonCheck-${{ steps.meta.outputs.version }}-windows-x64.exe
+            build/JsonCheck-${{ steps.meta.outputs.version }}-darwin-arm64
