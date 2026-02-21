@@ -15,6 +15,7 @@ use super::TranslateConfig;
 pub enum Provider {
     Free,
     GoogleCloud,
+    Gas,
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -312,6 +313,7 @@ impl Translator {
     pub fn provider_label(&self) -> &'static str {
         match self.provider_primary {
             Provider::GoogleCloud => "google-cloud",
+            Provider::Gas => "gas",
             Provider::Free => "free",
         }
     }
@@ -330,6 +332,7 @@ impl Translator {
         let provider_str = cfg.provider.as_ref().map(|s| s.to_lowercase());
         let provider_primary = match provider_str.as_deref() {
             Some("google-cloud") => Provider::GoogleCloud,
+            Some("gas") => Provider::Gas,
             Some("free") => Provider::Free,
             // auto
             _ => {
@@ -401,43 +404,63 @@ impl Translator {
                         with_retry(|| translate_google_cloud(&t, &this.source, &this.target, key), "google-cloud").await
                     };
                     let try_gas = || with_retry(|| translate_via_gas(&t, &this.source, &this.target, &this.gas_url), "gas");
-
-                    let primary_google = if this.provider_primary == Provider::GoogleCloud {
-                        Provider::GoogleCloud
-                    } else {
-                        Provider::Free
-                    };
-                    let secondary_google = if primary_google == Provider::GoogleCloud {
-                        Provider::Free
-                    } else {
-                        Provider::GoogleCloud
-                    };
-
-                    let call_google = |which: Provider| async move {
-                        match which {
-                            Provider::Free => try_free().await,
-                            Provider::GoogleCloud => try_cloud().await,
-                        }
-                    };
-
-                    // Primary google → GAS → Secondary google (if available)
-                    let translated = match call_google(primary_google).await {
-                        Ok(v) => v,
-                        Err(e1) => {
-                            if !is_likely_google_api_error(&e1) {
-                                return Err(e1);
-                            }
-                            match try_gas().await {
-                                Ok(v) => v,
-                                Err(e2) => {
-                                    if secondary_google == Provider::GoogleCloud && !this.has_cloud {
-                                        return Err(e2);
-                                    }
-                                    call_google(secondary_google).await?
-                                }
-                            }
-                        }
-                    };
+                                    // Decide sequence based on selected primary provider
+                                    let translated = match this.provider_primary {
+                                        Provider::GoogleCloud => {
+                                            match try_cloud().await {
+                                                Ok(v) => v,
+                                                Err(e1) => {
+                                                    if !is_likely_google_api_error(&e1) {
+                                                        return Err(e1);
+                                                    }
+                                                    match try_gas().await {
+                                                        Ok(v) => v,
+                                                        Err(e2) => {
+                                                            if !this.has_cloud {
+                                                                return Err(e2);
+                                                            }
+                                                            try_free().await?
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Provider::Free => {
+                                            match try_free().await {
+                                                Ok(v) => v,
+                                                Err(e1) => {
+                                                    if !is_likely_google_api_error(&e1) {
+                                                        return Err(e1);
+                                                    }
+                                                    match try_gas().await {
+                                                        Ok(v) => v,
+                                                        Err(e2) => {
+                                                            if this.has_cloud {
+                                                                try_cloud().await?
+                                                            } else {
+                                                                return Err(e2);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Provider::Gas => {
+                                            match try_gas().await {
+                                                Ok(v) => v,
+                                                Err(_e1) => {
+                                                    if this.has_cloud {
+                                                        match try_cloud().await {
+                                                            Ok(v) => v,
+                                                            Err(_e2) => { try_free().await? }
+                                                        }
+                                                    } else {
+                                                        try_free().await?
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    };
 
                     Ok::<_, TranslateError>(translated)
                 };

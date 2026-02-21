@@ -36,7 +36,7 @@ function App() {
   const [repairBrokenTargetInJar, setRepairBrokenTargetInJar] = useState(false);
   const [backupJars, setBackupJars] = useState(true);
 
-  const [provider, setProvider] = useState<"auto" | "free" | "google-cloud">("auto");
+  const [provider, setProvider] = useState<"auto" | "free" | "google-cloud" | "gas">("auto");
   const [googleApiKey, setGoogleApiKey] = useState<string>("");
   const [gasUrl, setGasUrl] = useState<string>("");
   const [concurrency, setConcurrency] = useState<number>(0);

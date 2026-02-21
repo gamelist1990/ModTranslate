@@ -1,8 +1,8 @@
 import React from "react";
 
 type TranslationSettingsSectionProps = {
-  provider: "auto" | "free" | "google-cloud";
-  setProvider: (val: "auto" | "free" | "google-cloud") => void;
+  provider: "auto" | "free" | "google-cloud" | "gas";
+  setProvider: (val: "auto" | "free" | "google-cloud" | "gas") => void;
   concurrency: number;
   setConcurrency: (val: number) => void;
   googleApiKey: string;
@@ -39,10 +39,9 @@ export const TranslationSettingsSection: React.FC<TranslationSettingsSectionProp
             <option value="auto">自動（APIキーがあればCloud優先）</option>
             <option value="free">Google Free 優先</option>
             <option value="google-cloud">Google Cloud 優先</option>
+            <option value="gas">GAS（Google Apps Script）優先</option>
           </select>
-          <div className="hint">
-            実行中は「Google → GAS → もう片方のGoogle」の順で自動フォールバックします
-          </div>
+          <div className="hint">実行中は選択に応じて順次フォールバックします（例: GAS → Google → もう片方）</div>
         </div>
         <div className="field">
           <label>並列数（任意 1〜32）</label>
