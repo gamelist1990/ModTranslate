@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { message, open as openDialog } from "@tauri-apps/plugin-dialog";
 import { openPath } from "@tauri-apps/plugin-opener";
 import "./App.css";
 
@@ -272,11 +272,15 @@ function App() {
   }
 
   async function openOutDir() {
-    if (!outDir.trim()) return;
+    const path = (done?.outDir ?? outDir).trim();
+    if (!path) return;
     try {
-      await openPath(outDir);
-    } catch {
-      // ignore
+      await openPath(path);
+    } catch (e) {
+      await message(`出力先を開けませんでした\n${String(e)}`, {
+        title: "ModTranslate",
+        kind: "error",
+      });
     }
   }
 
