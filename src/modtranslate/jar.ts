@@ -6,7 +6,6 @@ export async function loadJarZip(jarPath: string): Promise<JSZip> {
 }
 
 export async function saveJarZip(zip: JSZip, jarPath: string): Promise<void> {
-  // NOTE: Overwrites the jar. Callers should create a backup if needed.
   const out = await zip.generateAsync({
     type: "nodebuffer",
     compression: "DEFLATE",

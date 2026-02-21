@@ -1,5 +1,5 @@
 export function normalizeMcLangFileStem(input: string): string {
-  // Accept: en_us, en_US, en-US, EN_us, en_us.json
+  
   const s = input.trim().replace(/\.json$/i, "");
   const m = /^([a-zA-Z]{2,3})[\-_]([a-zA-Z]{2,3})$/.exec(s);
   if (m) {

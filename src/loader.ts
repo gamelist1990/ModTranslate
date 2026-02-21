@@ -3,13 +3,11 @@ import inquirer from "inquirer";
 import path from "node:path";
 import cliProgress from "cli-progress";
 import { performance } from "node:perf_hooks";
-
 import { createRunScreenAnsi, type RunScreenStats as TermRunScreenStats } from "./ui/run_screen_ansi";
-
 import { ensureResourcePackBase, writeLangFile } from "./modtranslate/resourcepack";
 import { listJarFiles } from "./modtranslate/fs";
 import { loadJarZip, listAssetNamespaces, readZipText, removeZipFile, saveJarZip, zipHasFile } from "./modtranslate/jar";
-import { parseJsoncObject } from "./modtranslate/jsonc";
+import { parseJsoncObject, tryParseJsoncObject } from "./modtranslate/jsonc";
 import { normalizeMcLangFileStem, toGoogleLang } from "./modtranslate/lang";
 import { createTranslator } from "./modtranslate/translate";
 
@@ -135,11 +133,7 @@ function createCliRunUi(totalMods: number): RunUi {
 		},
 		isAborted: () => aborted,
 		stop: () => {
-			try {
-				multibar.stop();
-			} catch {
-				// ignore
-			}
+			multibar.stop();
 		},
 	};
 }
@@ -185,13 +179,9 @@ async function buildPlan(
 				const dstPath = `assets/${ns}/lang/${opts.target}.json`;
 				if (!zipHasFile(zip, srcPath)) continue;
 				if (zipHasFile(zip, dstPath)) {
-					// target language exists in jar => usually skip.
-					// BUT: if it's broken JSON, treat it as "not supported" and (optionally) remove from the jar.
 					let isBroken = false;
-					try {
-						const dstText = await readZipText(zip, dstPath);
-						parseJsoncObject(dstText, `${jarPath}:${dstPath}`);
-					} catch {
+					const dstText = await readZipText(zip, dstPath);
+					if (!tryParseJsoncObject(dstText, `${jarPath}:${dstPath}`)) {
 						isBroken = true;
 						brokenTargetFound++;
 					}
@@ -216,10 +206,9 @@ async function buildPlan(
 							repairedTarget++;
 						} catch {
 							repairErrors++;
-							// Even if repair fails, we still plan translation into the resource pack.
 						}
 					}
-					// If broken (and removed or not), fall through and plan translation.
+                    
 				}
 
 				const t: PlanTask = { jarPath, jarName, namespace: ns, srcPath, dstPath };
@@ -240,8 +229,6 @@ async function buildPlan(
 			planErrors++;
 		}
 	}
-
-	// stable order
 	for (const [k, arr] of tasksByJar) {
 		arr.sort((a, b) => a.namespace.localeCompare(b.namespace));
 		tasksByJar.set(k, arr);
@@ -251,8 +238,6 @@ async function buildPlan(
 }
 
 function parseArgs(argv: string[]): Partial<CliOptions> {
-	// Minimal arg parser:
-	// --dir <path> --out <path> --source en_us --target ja_jp --yes --jar <file> (repeatable)
 	const out: Partial<CliOptions> = {};
 	const jars: string[] = [];
 
@@ -304,7 +289,7 @@ function parseArgs(argv: string[]): Partial<CliOptions> {
 			continue;
 		}
 
-		// --key=value style
+    
 		if (a.startsWith("--") && a.includes("=")) {
 			const [k, v] = a.split("=", 2);
 			if (v === undefined || v.length === 0) continue;
@@ -341,7 +326,7 @@ function parseArgs(argv: string[]): Partial<CliOptions> {
 async function promptMissingOptions(partial: Partial<CliOptions>): Promise<CliOptions> {
 	const baseDir = partial.dir ?? process.cwd();
 
-	// 1) First prompt: basics (dir/source/target/outDir/yes)
+    
 	const first = await inquirer.prompt([
 		{
 			type: "input",
@@ -435,7 +420,7 @@ async function promptMissingOptions(partial: Partial<CliOptions>): Promise<CliOp
 	);
 	const backupJars = Boolean(first.backupJars ?? partial.backupJars ?? true);
 
-	// 2) Second prompt: jar selection or manual jar path input
+    
 	let jars: string[] = partial.jars ? [...partial.jars] : [];
 	if (jars.length === 0) {
 		const jarFiles = await listJarFiles(dir);
@@ -543,7 +528,7 @@ async function main() {
 
 		let ui: RunUi | undefined;
 		const onSigint = () => {
-			// If Ink run screen is active, request abort and keep UI.
+        
 			if (ui) {
 				ui.requestAbort();
 				ui.log("ABORT: Ctrl+C");
@@ -555,9 +540,7 @@ async function main() {
 		};
 		process.once("SIGINT", onSigint);
 
-		// Processing UI:
-		// - Default: terminal-kit full-screen UI (TTY only)
-		// - Fallback: cli-progress (non-TTY or MODTRANSLATE_RUN_UI=cli)
+        
 		const runUi = (Bun.env.MODTRANSLATE_RUN_UI ?? "term").toLowerCase();
 		const isTty = Boolean(process.stdout.isTTY);
 		if (runUi !== "cli" && isTty) {
@@ -604,12 +587,11 @@ async function main() {
 
 		for (const [jarPath, tasks] of plan.tasksByJar) {
 			let zip;
-			try {
-				zip = await loadJarZip(jarPath);
-			} catch (e) {
-				// If a jar fails to load, mark all its planned tasks as errors and advance.
-				errors += tasks.length;
-				doneMods += tasks.length;
+				try {
+					zip = await loadJarZip(jarPath);
+				} catch (e) {
+					errors += tasks.length;
+					doneMods += tasks.length;
 				ui?.update({
 					doneMods,
 					translated: translatedMods,
@@ -620,7 +602,7 @@ async function main() {
 					keyDone: 0,
 					keyNote: "jar読込失敗",
 				});
-				ui?.log(`ERR jar読込失敗: ${jarPath} (${String(e)})`);
+					ui?.log(`ERR jar読込失敗: ${jarPath} (${String(e)})`);
 				continue;
 			}
 
@@ -657,20 +639,14 @@ async function main() {
 						continue;
 					}
 
-					// Read source JSON
 					const srcText = await readZipText(zip, task.srcPath);
 					const data = parseJsoncObject(srcText, `${task.jarPath}:${task.srcPath}`);
 
-					// Load existing output translation if present
 					const outLangPath = path.join(opts.outDir, "assets", task.namespace, "lang", `${opts.target}.json`);
 					let existingTarget: Record<string, unknown> | undefined;
 					if (await Bun.file(outLangPath).exists()) {
-						try {
-							const existingText = await Bun.file(outLangPath).text();
-							existingTarget = parseJsoncObject(existingText, outLangPath);
-						} catch {
-							existingTarget = undefined;
-						}
+						const existingText = await Bun.file(outLangPath).text();
+						existingTarget = tryParseJsoncObject(existingText, outLangPath);
 					}
 
 					const translated: Record<string, unknown> = existingTarget ? { ...existingTarget } : {};
@@ -799,7 +775,6 @@ async function main() {
 			),
 		);
 	} catch (e) {
-		// Inquirer throws ExitPromptError on Ctrl+C.
 		const msg = String(e);
 		if (msg.includes("ExitPromptError") || msg.includes("SIGINT")) {
 			console.log(chalk.yellow("中断しました。"));

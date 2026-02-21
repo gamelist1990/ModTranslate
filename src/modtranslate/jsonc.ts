@@ -1,5 +1,3 @@
-// Very small JSONC parser: strips // and /* */ comments.
-
 export function stripJsonComments(input: string): string {
   const noLine = input.replace(/(^|\s)\/\/.*$/gm, "$1");
   return noLine.replace(/\/\*[\s\S]*?\*\//g, "");
@@ -15,5 +13,16 @@ export function parseJsoncObject(input: string, label = "<json>"): Record<string
     return v as Record<string, unknown>;
   } catch (e) {
     throw new Error(`Failed to parse JSON (${label}): ${String(e)}`);
+  }
+}
+
+export function tryParseJsoncObject(input: string, label = "<json>"): Record<string, unknown> | undefined {
+  const cleaned = stripJsonComments(input);
+  try {
+    const v = JSON.parse(cleaned) as unknown;
+    if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
+    return v as Record<string, unknown>;
+  } catch {
+    return undefined;
   }
 }

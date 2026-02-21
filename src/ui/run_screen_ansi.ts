@@ -135,7 +135,6 @@ export function createRunScreenAnsi(initial: RunScreenStats): RunScreenControlle
           ? chalk.bold.yellow(state)
           : chalk.bold.cyan(state);
 
-    // Layout widths
     const keyColW = 10;
     const padding = 6; // table borders + spacing
     const valColW = clamp(cols - keyColW - padding, 20, 200);
@@ -210,14 +209,13 @@ export function createRunScreenAnsi(initial: RunScreenStats): RunScreenControlle
     logUpdate(out);
   };
 
-  // Setup keypress
+  
   readline.emitKeypressEvents(process.stdin);
   if (process.stdin.isTTY) {
     try {
       process.stdin.setRawMode(true);
       rawModeEnabled = true;
     } catch {
-      // ignore
     }
   }
   process.stdin.on("keypress", onKeypress);
@@ -235,13 +233,11 @@ export function createRunScreenAnsi(initial: RunScreenStats): RunScreenControlle
       try {
         process.stdin.setRawMode(false);
       } catch {
-        // ignore
       }
     }
     try {
       logUpdate.done();
     } catch {
-      // ignore
     }
     if (cursorHidden) showCursor();
     process.stdout.write("\n");

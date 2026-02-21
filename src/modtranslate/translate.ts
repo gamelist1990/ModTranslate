@@ -122,7 +122,6 @@ async function withRetry<T>(fn: () => Promise<T>, label: string): Promise<T> {
 
       const retryable = isRetryableHttp || isRetryableMsg;
 
-      // If it's not retryable, don't waste time retrying.
       if (!retryable) break;
 
       const backoff = Math.min(30_000, 400 * 2 ** attempt) + Math.floor(Math.random() * 250);
@@ -198,8 +197,7 @@ function isRateLimitError(e: unknown): boolean {
 }
 
 function isLikelyGoogleApiError(e: unknown): boolean {
-  // Our "Google API" here includes both the free endpoint and Google Cloud API.
-  // Basically anything HTTP/network-ish counts.
+  
   const http = unwrapHttpError(e);
   if (http) return true;
   const msg = String(e).toLowerCase();
@@ -252,8 +250,6 @@ export function createTranslator(opts: CreateTranslatorOpts): Translator {
   const provider: Translator["provider"] =
     envProvider === "google-cloud" ? "google-cloud" : hasCloud ? "google-cloud" : "free";
 
-  // Concurrency: higher = faster, but may trigger rate limits.
-  // Default is conservative.
   const envConc = Number(Bun.env.TRANSLATE_CONCURRENCY ?? "");
   const defaultConc = provider === "google-cloud" ? 4 : 3;
   const chosenConc =
@@ -276,7 +272,6 @@ export function createTranslator(opts: CreateTranslatorOpts): Translator {
     if (existing) return existing;
 
     const p = limiter(async () => {
-      // Light throttle to avoid rate limits (per request).
       await sleep(60);
 
       let translated: string;
@@ -295,9 +290,7 @@ export function createTranslator(opts: CreateTranslatorOpts): Translator {
         return which === "free" ? await tryGoogleFree() : await tryGoogleCloud();
       };
 
-      // Desired behavior:
-      // - Google API errors (429/500/etc) => fallback to GAS
-      // - GAS errors => fallback back to Google API
+      
       try {
         translated = await callGoogle(primaryGoogle);
       } catch (e1) {
@@ -343,7 +336,7 @@ export function createTranslator(opts: CreateTranslatorOpts): Translator {
         opts?.onProgress?.(done, total);
       };
 
-      // Parallelize with concurrency limit (inside translateRaw). Preserve order.
+      
       const ps = texts.map(async (t) => {
         try {
           const r = await translateOne(t);
