@@ -268,7 +268,7 @@ function App() {
 
   async function cancel() {
     if (!runId) return;
-    await invoke<boolean>("cancel_run", { run_id: runId });
+    await invoke<boolean>("cancel_run", { runId: runId });
   }
 
   async function openOutDir() {
