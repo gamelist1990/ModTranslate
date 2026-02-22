@@ -40,6 +40,8 @@ function App() {
   const [googleApiKey, setGoogleApiKey] = useState<string>("");
   const [deeplApiKey, setDeeplApiKey] = useState<string>("");
   const [concurrency, setConcurrency] = useState<number>(0);
+  const [claudeBaseUrl, setClaudeBaseUrl] = useState<string>("");
+  const [claudeModels, setClaudeModels] = useState<string>("");
 
   useEffect(() => {
     (async () => {
@@ -51,6 +53,8 @@ function App() {
           if (typeof res.googleApiKey === "string") setGoogleApiKey(res.googleApiKey);
           if (typeof res.deeplApiKey === "string") setDeeplApiKey(res.deeplApiKey);
           if (typeof res.concurrency === "number") setConcurrency(res.concurrency);
+          if (typeof res.claudeBaseUrl === "string") setClaudeBaseUrl(res.claudeBaseUrl);
+          if (typeof res.claudeModels === "string") setClaudeModels(res.claudeModels);
         }
       } catch {
         // ignore
@@ -67,13 +71,15 @@ function App() {
             googleApiKey: googleApiKey || null,
             deeplApiKey: deeplApiKey || null,
             concurrency: concurrency > 0 ? clampInt(concurrency, 1, 32) : null,
+            claudeBaseUrl: claudeBaseUrl || null,
+            claudeModels: claudeModels || null,
           },
         });
       } catch {
         // ignore
       }
     })();
-  }, [provider, googleApiKey, deeplApiKey, concurrency]);
+  }, [provider, googleApiKey, deeplApiKey, concurrency, claudeBaseUrl, claudeModels]);
 
   const [jarFiles, setJarFiles] = useState<JarFile[]>([]);
   const [selectedJars, setSelectedJars] = useState<string[]>([]);
@@ -105,6 +111,8 @@ function App() {
         googleApiKey: googleApiKey || null,
         deeplApiKey: deeplApiKey || null,
         concurrency: concurrency > 0 ? clampInt(concurrency, 1, 32) : null,
+        claudeBaseUrl: claudeBaseUrl || null,
+        claudeModels: claudeModels || null,
       },
     }),
     [
@@ -119,6 +127,8 @@ function App() {
       googleApiKey,
       deeplApiKey,
       concurrency,
+      claudeBaseUrl,
+      claudeModels,
     ],
   );
 
@@ -146,8 +156,16 @@ function App() {
       });
       unlistenLog = await listen<LogEvent>("modtranslate:log", (e) => {
         if (!runId || e.payload.runId !== runId) return;
+        const line = e.payload.line;
+        if (line.startsWith("ERR")) {
+          console.error(line);
+        } else if (line.startsWith("WARN")) {
+          console.warn(line);
+        } else {
+          console.log(line);
+        }
         setLogs((prev) => {
-          const next = [...prev, e.payload.line];
+          const next = [...prev, line];
           return next.length > 2000 ? next.slice(next.length - 2000) : next;
         });
       });
@@ -374,6 +392,10 @@ function App() {
           setGoogleApiKey={setGoogleApiKey}
           deeplApiKey={deeplApiKey}
           setDeeplApiKey={setDeeplApiKey}
+          claudeBaseUrl={claudeBaseUrl}
+          setClaudeBaseUrl={setClaudeBaseUrl}
+          claudeModels={claudeModels}
+          setClaudeModels={setClaudeModels}
           busy={busy}
           isRunning={isRunning}
         />

@@ -1,8 +1,4 @@
-use std::{
-    collections::HashMap,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use futures::{future::BoxFuture, FutureExt};
 use regex::Regex;
@@ -45,6 +41,39 @@ const CLAUDE_OPENAI_COMPAT_MODELS: [&str; 4] = [
     "claude-sonnet-4.5",
 ];
 
+const AI_HTTP_TIMEOUT_SECS: u64 = 600;
+
+fn normalize_base_url(input: &str) -> String {
+    let s = input.trim();
+    if s.is_empty() {
+        return CLAUDE_OPENAI_COMPAT_BASE_URL.to_string();
+    }
+    if s.ends_with('/') {
+        s.to_string()
+    } else {
+        format!("{}/", s)
+    }
+}
+
+fn parse_models(input: Option<&str>) -> Vec<String> {
+    let raw = input.unwrap_or("");
+    let mut models: Vec<String> = raw
+        .split(|c| c == '\n' || c == '\r' || c == ',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .take(16)
+        .map(|s| s.to_string())
+        .collect();
+
+    if models.is_empty() {
+        models = CLAUDE_OPENAI_COMPAT_MODELS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+    }
+    models
+}
+
 fn extract_json_array_str(s: &str) -> Option<&str> {
     let start = s.find('[')?;
     let end = s.rfind(']')?;
@@ -52,6 +81,187 @@ fn extract_json_array_str(s: &str) -> Option<&str> {
         return None;
     }
     Some(&s[start..=end])
+}
+
+async fn translate_ollama_chat_single(
+    text: &str,
+    source: &str,
+    target: &str,
+    base_url: &str,
+    model: &str,
+) -> Result<String, TranslateError> {
+    let base = reqwest::Url::parse(base_url).map_err(|e| TranslateError::Request(e.to_string()))?;
+    let url = base
+        .join("api/chat")
+        .map_err(|e| TranslateError::Request(e.to_string()))?;
+
+    let client = reqwest::Client::new();
+    let system = format!(
+        "You are a translation engine. Translate from {source} to {target}. \
+Return ONLY the translated text (no quotes, no markdown). \
+Do NOT alter tokens like __MT0__ or __MT12__. Preserve them exactly.",
+        source = source,
+        target = target
+    );
+
+    let res = client
+        .post(url)
+        .json(&serde_json::json!({
+            "model": model,
+            "stream": false,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": text},
+            ],
+            "options": {"temperature": 0},
+        }))
+        .timeout(Duration::from_secs(AI_HTTP_TIMEOUT_SECS))
+        .send()
+        .await
+        .map_err(|e| TranslateError::Request(e.to_string()))?;
+
+    if !res.status().is_success() {
+        let status_code = res.status().as_u16();
+        let status_text = res.status().to_string();
+        let msg = res.text().await.unwrap_or(status_text);
+        return Err(TranslateError::Http {
+            status: status_code,
+            message: msg,
+        });
+    }
+
+    let data: serde_json::Value = res
+        .json()
+        .await
+        .map_err(|e| TranslateError::Request(e.to_string()))?;
+
+    let content = data
+        .get("message")
+        .and_then(|v| v.get("content"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    if content.is_empty() {
+        return Err(TranslateError::Request(
+            "Ollama returned empty content".to_string(),
+        ));
+    }
+
+    Ok(content)
+}
+
+async fn translate_ollama_chat_batch(
+    texts: &[String],
+    source: &str,
+    target: &str,
+    base_url: &str,
+    model: &str,
+) -> Result<Vec<String>, TranslateError> {
+    let base = reqwest::Url::parse(base_url).map_err(|e| TranslateError::Request(e.to_string()))?;
+    let url = base
+        .join("api/chat")
+        .map_err(|e| TranslateError::Request(e.to_string()))?;
+
+    let client = reqwest::Client::new();
+    let system = format!(
+        "You are a translation engine. Translate each item from {source} to {target}.\n\n\
+STRICT OUTPUT FORMAT (MUST FOLLOW):\n\
+- Output MUST be ONLY a valid JSON array of strings.\n\
+- The array length MUST equal the input length, and order MUST match input order.\n\
+- Do NOT wrap in markdown/code fences. Do NOT add explanations.\n\
+- Output MUST start with '[' and end with ']'.\n\
+- Do NOT alter tokens like __MT0__ or __MT12__. Preserve them exactly.\n",
+        source = source,
+        target = target
+    );
+
+    let user_payload =
+        serde_json::to_string(texts).map_err(|e| TranslateError::Request(e.to_string()))?;
+
+    let schema = serde_json::json!({
+        "type": "array",
+        "items": {"type": "string"},
+        "minItems": texts.len(),
+        "maxItems": texts.len(),
+    });
+
+    let res = client
+        .post(url)
+        .json(&serde_json::json!({
+            "model": model,
+            "stream": false,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_payload},
+            ],
+            "format": schema,
+            "options": {"temperature": 0},
+        }))
+        .timeout(Duration::from_secs(AI_HTTP_TIMEOUT_SECS))
+        .send()
+        .await
+        .map_err(|e| TranslateError::Request(e.to_string()))?;
+
+    if !res.status().is_success() {
+        let status_code = res.status().as_u16();
+        let status_text = res.status().to_string();
+        let msg = res.text().await.unwrap_or(status_text);
+        return Err(TranslateError::Http {
+            status: status_code,
+            message: msg,
+        });
+    }
+
+    let data: serde_json::Value = res
+        .json()
+        .await
+        .map_err(|e| TranslateError::Request(e.to_string()))?;
+
+    let content = data
+        .get("message")
+        .and_then(|v| v.get("content"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    if content.is_empty() {
+        return Err(TranslateError::Request(
+            "Ollama returned empty content".to_string(),
+        ));
+    }
+
+    let json_str = match serde_json::from_str::<serde_json::Value>(&content) {
+        Ok(v) => serde_json::to_string(&v).unwrap_or(content.clone()),
+        Err(_) => extract_json_array_str(&content)
+            .unwrap_or(content.as_str())
+            .to_string(),
+    };
+
+    let arr_val: serde_json::Value =
+        serde_json::from_str(&json_str).map_err(|e| TranslateError::Request(e.to_string()))?;
+    let arr = arr_val
+        .as_array()
+        .ok_or_else(|| TranslateError::Request("Ollama JSON is not an array".to_string()))?;
+
+    if arr.len() != texts.len() {
+        return Err(TranslateError::Request(format!(
+            "Ollama JSON length mismatch: expected {}, got {}",
+            texts.len(),
+            arr.len()
+        )));
+    }
+
+    let mut out: Vec<String> = Vec::with_capacity(arr.len());
+    for it in arr {
+        let s = it.as_str().ok_or_else(|| {
+            TranslateError::Request("Ollama JSON item is not a string".to_string())
+        })?;
+        out.push(s.to_string());
+    }
+    Ok(out)
 }
 
 fn clamp_u32(v: Option<u32>, min: u32, max: u32, fallback: u32) -> u32 {
@@ -76,7 +286,9 @@ fn to_deepl_lang(mc_lang: &str) -> String {
         ("en", Some("us")) => "EN-US".to_string(),
         ("en", Some("gb")) => "EN-GB".to_string(),
         ("pt", Some("br")) => "PT-BR".to_string(),
-        (p, Some(s)) if matches!(p, "en" | "pt") => format!("{}-{}", p.to_uppercase(), s.to_uppercase()),
+        (p, Some(s)) if matches!(p, "en" | "pt") => {
+            format!("{}-{}", p.to_uppercase(), s.to_uppercase())
+        }
         (p, _) => p.to_uppercase(),
     }
 }
@@ -153,7 +365,8 @@ where
 
                 last = Some(e);
 
-                let backoff = (400u64.saturating_mul(2u64.saturating_pow(attempt as u32))).min(30_000);
+                let backoff =
+                    (400u64.saturating_mul(2u64.saturating_pow(attempt as u32))).min(30_000);
                 let jitter = (fastrand::u64(..250)) as u64;
                 tokio::time::sleep(Duration::from_millis(backoff + jitter)).await;
             }
@@ -214,7 +427,12 @@ async fn translate_free(text: &str, source: &str, target: &str) -> Result<String
     Ok(text.to_string())
 }
 
-async fn translate_google_cloud(text: &str, source: &str, target: &str, api_key: &str) -> Result<String, TranslateError> {
+async fn translate_google_cloud(
+    text: &str,
+    source: &str,
+    target: &str,
+    api_key: &str,
+) -> Result<String, TranslateError> {
     let mut url = reqwest::Url::parse("https://translation.googleapis.com/language/translate/v2")
         .map_err(|e| TranslateError::Request(e.to_string()))?;
     url.query_pairs_mut().append_pair("key", api_key);
@@ -261,7 +479,12 @@ struct GasResp {
     translation: Option<String>,
 }
 
-async fn translate_via_gas(text: &str, source: &str, target: &str, gas_url: &str) -> Result<String, TranslateError> {
+async fn translate_via_gas(
+    text: &str,
+    source: &str,
+    target: &str,
+    gas_url: &str,
+) -> Result<String, TranslateError> {
     let url = reqwest::Url::parse(gas_url).map_err(|e| TranslateError::Request(e.to_string()))?;
 
     let client = reqwest::Client::new();
@@ -287,7 +510,9 @@ async fn translate_via_gas(text: &str, source: &str, target: &str, gas_url: &str
 
     let translated = data.translation.unwrap_or_default();
     if translated.trim().is_empty() {
-        return Err(TranslateError::Request("翻訳結果が取得できませんでした。".to_string()));
+        return Err(TranslateError::Request(
+            "翻訳結果が取得できませんでした。".to_string(),
+        ));
     }
 
     Ok(translated)
@@ -303,7 +528,12 @@ struct DeepLResp {
     translations: Vec<DeepLTranslation>,
 }
 
-async fn translate_deepl(text: &str, source: &str, target: &str, api_key: &str) -> Result<String, TranslateError> {
+async fn translate_deepl(
+    text: &str,
+    source: &str,
+    target: &str,
+    api_key: &str,
+) -> Result<String, TranslateError> {
     let key = api_key.trim();
     if key.is_empty() {
         return Err(TranslateError::MissingDeepLKey);
@@ -325,7 +555,10 @@ async fn translate_deepl(text: &str, source: &str, target: &str, api_key: &str) 
     let client = reqwest::Client::new();
     let res = client
         .post(endpoint)
-        .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        )
         .body(body)
         .timeout(Duration::from_secs(20))
         .send()
@@ -355,8 +588,14 @@ async fn translate_deepl(text: &str, source: &str, target: &str, api_key: &str) 
     Ok(translated)
 }
 
-async fn translate_claude_ai_openai_compat(text: &str, source: &str, target: &str) -> Result<String, TranslateError> {
-    let base = reqwest::Url::parse(CLAUDE_OPENAI_COMPAT_BASE_URL).map_err(|e| TranslateError::Request(e.to_string()))?;
+async fn translate_claude_ai_openai_compat(
+    text: &str,
+    source: &str,
+    target: &str,
+    base_url: &str,
+    models: &[String],
+) -> Result<String, TranslateError> {
+    let base = reqwest::Url::parse(base_url).map_err(|e| TranslateError::Request(e.to_string()))?;
     let url = base
         .join("chat/completions")
         .map_err(|e| TranslateError::Request(e.to_string()))?;
@@ -373,10 +612,13 @@ Do NOT alter tokens like __MT0__ or __MT12__. Preserve them exactly.",
 
     let mut last_err: Option<TranslateError> = None;
 
-    for model in CLAUDE_OPENAI_COMPAT_MODELS {
+    for model in models {
         let res = match client
             .post(url.clone())
-            .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", CLAUDE_OPENAI_COMPAT_API_KEY))
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {}", CLAUDE_OPENAI_COMPAT_API_KEY),
+            )
             .json(&serde_json::json!({
                 "model": model,
                 "messages": [
@@ -386,7 +628,7 @@ Do NOT alter tokens like __MT0__ or __MT12__. Preserve them exactly.",
                 "temperature": 0,
                 "stream": false,
             }))
-            .timeout(Duration::from_secs(40))
+            .timeout(Duration::from_secs(AI_HTTP_TIMEOUT_SECS))
             .send()
             .await
         {
@@ -401,6 +643,18 @@ Do NOT alter tokens like __MT0__ or __MT12__. Preserve them exactly.",
             let status_code = res.status().as_u16();
             let status_text = res.status().to_string();
             let msg = res.text().await.unwrap_or(status_text);
+
+            // If the server isn't OpenAI-compatible (e.g., Ollama), try its native API.
+            if status_code == 404 {
+                match translate_ollama_chat_single(text, source, target, base_url, model).await {
+                    Ok(v) => return Ok(v),
+                    Err(e2) => {
+                        last_err = Some(e2);
+                        continue;
+                    }
+                }
+            }
+
             last_err = Some(TranslateError::Http {
                 status: status_code,
                 message: msg,
@@ -439,18 +693,28 @@ Do NOT alter tokens like __MT0__ or __MT12__. Preserve them exactly.",
 
         let content = content.trim().to_string();
         if content.is_empty() {
-            last_err = Some(TranslateError::Request(format!("Claude(AI) returned empty content for model: {}", model)));
+            last_err = Some(TranslateError::Request(format!(
+                "Claude(AI) returned empty content for model: {}",
+                model
+            )));
             continue;
         }
 
         return Ok(content);
     }
 
-    Err(last_err.unwrap_or_else(|| TranslateError::Request("Claude(AI) request failed".to_string())))
+    Err(last_err
+        .unwrap_or_else(|| TranslateError::Request("Claude(AI) request failed".to_string())))
 }
 
-async fn translate_claude_ai_openai_compat_batch(texts: &[String], source: &str, target: &str) -> Result<Vec<String>, TranslateError> {
-    let base = reqwest::Url::parse(CLAUDE_OPENAI_COMPAT_BASE_URL).map_err(|e| TranslateError::Request(e.to_string()))?;
+async fn translate_claude_ai_openai_compat_batch(
+    texts: &[String],
+    source: &str,
+    target: &str,
+    base_url: &str,
+    models: &[String],
+) -> Result<Vec<String>, TranslateError> {
+    let base = reqwest::Url::parse(base_url).map_err(|e| TranslateError::Request(e.to_string()))?;
     let url = base
         .join("chat/completions")
         .map_err(|e| TranslateError::Request(e.to_string()))?;
@@ -472,13 +736,17 @@ Output: [\"こんにちは __MT0__\", \"さようなら\"]\n",
         target = target
     );
 
-    let user_payload = serde_json::to_string(texts).map_err(|e| TranslateError::Request(e.to_string()))?;
+    let user_payload =
+        serde_json::to_string(texts).map_err(|e| TranslateError::Request(e.to_string()))?;
 
     let mut last_err: Option<TranslateError> = None;
-    for model in CLAUDE_OPENAI_COMPAT_MODELS {
+    for model in models {
         let res = match client
             .post(url.clone())
-            .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", CLAUDE_OPENAI_COMPAT_API_KEY))
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {}", CLAUDE_OPENAI_COMPAT_API_KEY),
+            )
             .json(&serde_json::json!({
                 "model": model,
                 "messages": [
@@ -488,7 +756,7 @@ Output: [\"こんにちは __MT0__\", \"さようなら\"]\n",
                 "temperature": 0,
                 "stream": false,
             }))
-            .timeout(Duration::from_secs(80))
+            .timeout(Duration::from_secs(AI_HTTP_TIMEOUT_SECS))
             .send()
             .await
         {
@@ -503,6 +771,17 @@ Output: [\"こんにちは __MT0__\", \"さようなら\"]\n",
             let status_code = res.status().as_u16();
             let status_text = res.status().to_string();
             let msg = res.text().await.unwrap_or(status_text);
+
+            if status_code == 404 {
+                match translate_ollama_chat_batch(texts, source, target, base_url, model).await {
+                    Ok(v) => return Ok(v),
+                    Err(e2) => {
+                        last_err = Some(e2);
+                        continue;
+                    }
+                }
+            }
+
             last_err = Some(TranslateError::Http {
                 status: status_code,
                 message: msg,
@@ -540,7 +819,10 @@ Output: [\"こんにちは __MT0__\", \"さようなら\"]\n",
 
         let content_trim = content.trim();
         if content_trim.is_empty() {
-            last_err = Some(TranslateError::Request(format!("Claude(AI) returned empty content for model: {}", model)));
+            last_err = Some(TranslateError::Request(format!(
+                "Claude(AI) returned empty content for model: {}",
+                model
+            )));
             continue;
         }
 
@@ -549,7 +831,9 @@ Output: [\"こんにちは __MT0__\", \"さようなら\"]\n",
                 // already valid JSON; re-serialize for uniform parsing below
                 serde_json::to_string(&v).unwrap_or_else(|_| content_trim.to_string())
             }
-            Err(_) => extract_json_array_str(content_trim).unwrap_or(content_trim).to_string(),
+            Err(_) => extract_json_array_str(content_trim)
+                .unwrap_or(content_trim)
+                .to_string(),
         };
 
         let arr: Vec<String> = match serde_json::from_str::<serde_json::Value>(&json_str)
@@ -567,7 +851,11 @@ Output: [\"こんにちは __MT0__\", \"さようなら\"]\n",
                         break;
                     }
                 }
-                if ok { out } else { Vec::new() }
+                if ok {
+                    out
+                } else {
+                    Vec::new()
+                }
             }
             None => Vec::new(),
         };
@@ -583,14 +871,18 @@ Output: [\"こんにちは __MT0__\", \"さようなら\"]\n",
         }
 
         if arr.iter().any(|s| s.trim().is_empty()) {
-            last_err = Some(TranslateError::Request(format!("Claude(AI) returned empty string item for model: {}", model)));
+            last_err = Some(TranslateError::Request(format!(
+                "Claude(AI) returned empty string item for model: {}",
+                model
+            )));
             continue;
         }
 
         return Ok(arr);
     }
 
-    Err(last_err.unwrap_or_else(|| TranslateError::Request("Claude(AI) batch request failed".to_string())))
+    Err(last_err
+        .unwrap_or_else(|| TranslateError::Request("Claude(AI) batch request failed".to_string())))
 }
 
 fn protect_placeholders(input: &str) -> (String, Vec<(String, String)>) {
@@ -626,12 +918,60 @@ fn protect_placeholders(input: &str) -> (String, Vec<(String, String)>) {
     (current, repls)
 }
 
+fn protect_placeholders_with_base(
+    input: &str,
+    base_index: usize,
+) -> (String, Vec<(String, String)>) {
+    static PATTERNS: std::sync::OnceLock<Vec<Regex>> = std::sync::OnceLock::new();
+    let patterns = PATTERNS.get_or_init(|| {
+        vec![
+            Regex::new(r"%(\d+\$)?[-+#0 ]*\d*(?:\.\d+)?[a-zA-Z]").unwrap(),
+            Regex::new(r"\{\d+\}").unwrap(),
+            Regex::new(r"§[0-9a-fk-or]").unwrap(),
+            Regex::new(r"\n").unwrap(),
+            Regex::new(r"\t").unwrap(),
+            Regex::new(r"\r").unwrap(),
+        ]
+    });
+
+    let mut current = input.to_string();
+    let mut repls: Vec<(String, String)> = Vec::new();
+    let mut index: usize = base_index;
+
+    for re in patterns {
+        let mut local: Vec<(String, String)> = Vec::new();
+        let replaced = re.replace_all(&current, |caps: &regex::Captures| {
+            let m = caps.get(0).map(|m| m.as_str()).unwrap_or("");
+            let token = format!("__MT{}__", index);
+            index += 1;
+            local.push((token.clone(), m.to_string()));
+            token
+        });
+        current = replaced.to_string();
+        repls.extend(local);
+    }
+
+    (current, repls)
+}
+
 fn restore_placeholders(translated: &str, repls: &[(String, String)]) -> String {
     let mut out = translated.to_string();
     for (token, original) in repls {
         out = out.replace(token, original);
     }
     out
+}
+
+fn has_unresolved_mt_tokens(s: &str) -> bool {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"__MT\d+__").unwrap());
+    re.is_match(s)
+}
+
+fn strip_unresolved_mt_tokens(s: &str) -> String {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"__MT\d+__").unwrap());
+    re.replace_all(s, "").to_string()
 }
 
 fn is_formatting_only(s: &str) -> bool {
@@ -695,8 +1035,17 @@ pub struct Translator {
     gas_url: String,
     semaphore: Arc<Semaphore>,
     concurrency: usize,
+    claude_base_url: String,
+    claude_models: Vec<String>,
     cache: Arc<Mutex<HashMap<String, String>>>,
-    inflight: Arc<Mutex<HashMap<String, futures::future::Shared<BoxFuture<'static, Result<String, TranslateError>>>>>>,
+    inflight: Arc<
+        Mutex<
+            HashMap<
+                String,
+                futures::future::Shared<BoxFuture<'static, Result<String, TranslateError>>>,
+            >,
+        >,
+    >,
 }
 
 impl Translator {
@@ -746,10 +1095,17 @@ impl Translator {
             }
         };
 
-        let conc_default = if provider_primary == Provider::GoogleCloud { 4 } else { 3 };
+        let conc_default = if provider_primary == Provider::GoogleCloud {
+            4
+        } else {
+            3
+        };
         let concurrency = clamp_u32(cfg.concurrency, 1, 32, conc_default);
 
         let gas_url = DEFAULT_GAS_URL.to_string();
+
+        let claude_base_url = normalize_base_url(cfg.claude_base_url.as_deref().unwrap_or(""));
+        let claude_models = parse_models(cfg.claude_models.as_deref());
 
         Self {
             source_google,
@@ -763,6 +1119,8 @@ impl Translator {
             gas_url,
             semaphore: Arc::new(Semaphore::new(concurrency as usize)),
             concurrency: concurrency as usize,
+            claude_base_url,
+            claude_models,
             cache: Arc::new(Mutex::new(HashMap::new())),
             inflight: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -772,7 +1130,11 @@ impl Translator {
         self.concurrency
     }
 
-    async fn translate_raw(&self, text: String, abort: &tokio_util::sync::CancellationToken) -> Result<String, TranslateError> {
+    async fn translate_raw(
+        &self,
+        text: String,
+        abort: &tokio_util::sync::CancellationToken,
+    ) -> Result<String, TranslateError> {
         if abort.is_cancelled() {
             return Err(TranslateError::Aborted);
         }
@@ -803,122 +1165,157 @@ impl Translator {
                     }
                     tokio::time::sleep(Duration::from_millis(60)).await;
 
-                    let try_free = || with_retry(|| translate_free(&t, &this.source_google, &this.target_google), "free");
+                    let try_free = || {
+                        with_retry(
+                            || translate_free(&t, &this.source_google, &this.target_google),
+                            "free",
+                        )
+                    };
                     let try_cloud = || async {
-                        let key = this.api_key.as_deref().ok_or(TranslateError::MissingApiKey)?;
-                        with_retry(|| translate_google_cloud(&t, &this.source_google, &this.target_google, key), "google-cloud").await
+                        let key = this
+                            .api_key
+                            .as_deref()
+                            .ok_or(TranslateError::MissingApiKey)?;
+                        with_retry(
+                            || {
+                                translate_google_cloud(
+                                    &t,
+                                    &this.source_google,
+                                    &this.target_google,
+                                    key,
+                                )
+                            },
+                            "google-cloud",
+                        )
+                        .await
                     };
-                    let try_gas = || with_retry(|| translate_via_gas(&t, &this.source_google, &this.target_google, &this.gas_url), "gas");
+                    let try_gas = || {
+                        with_retry(
+                            || {
+                                translate_via_gas(
+                                    &t,
+                                    &this.source_google,
+                                    &this.target_google,
+                                    &this.gas_url,
+                                )
+                            },
+                            "gas",
+                        )
+                    };
                     let try_deepl = || async {
-                        let key = this.deepl_api_key.as_deref().ok_or(TranslateError::MissingDeepLKey)?;
-                        with_retry(|| translate_deepl(&t, &this.source_deepl, &this.target_deepl, key), "deepl").await
+                        let key = this
+                            .deepl_api_key
+                            .as_deref()
+                            .ok_or(TranslateError::MissingDeepLKey)?;
+                        with_retry(
+                            || translate_deepl(&t, &this.source_deepl, &this.target_deepl, key),
+                            "deepl",
+                        )
+                        .await
                     };
-                    let try_claude = || with_retry(|| translate_claude_ai_openai_compat(&t, &this.source_google, &this.target_google), "claude-ai");
-                                    // Decide sequence based on selected primary provider
-                                    let translated = match this.provider_primary {
-                                        Provider::GoogleCloud => {
-                                            match try_cloud().await {
-                                                Ok(v) => v,
-                                                Err(e1) => {
-                                                    if !is_likely_google_api_error(&e1) {
-                                                        return Err(e1);
-                                                    }
-                                                    match try_gas().await {
-                                                        Ok(v) => v,
-                                                        Err(e2) => {
-                                                            if !this.has_cloud {
-                                                                return Err(e2);
-                                                            }
-                                                            try_free().await?
-                                                        }
-                                                    }
-                                                }
-                                            }
+                    let try_claude = || {
+                        with_retry(
+                            || {
+                                translate_claude_ai_openai_compat(
+                                    &t,
+                                    &this.source_google,
+                                    &this.target_google,
+                                    &this.claude_base_url,
+                                    &this.claude_models,
+                                )
+                            },
+                            "claude-ai",
+                        )
+                    };
+                    // Decide sequence based on selected primary provider
+                    let translated = match this.provider_primary {
+                        Provider::GoogleCloud => match try_cloud().await {
+                            Ok(v) => v,
+                            Err(e1) => {
+                                if !is_likely_google_api_error(&e1) {
+                                    return Err(e1);
+                                }
+                                match try_gas().await {
+                                    Ok(v) => v,
+                                    Err(e2) => {
+                                        if !this.has_cloud {
+                                            return Err(e2);
                                         }
-                                        Provider::Free => {
-                                            match try_free().await {
-                                                Ok(v) => v,
-                                                Err(e1) => {
-                                                    if !is_likely_google_api_error(&e1) {
-                                                        return Err(e1);
-                                                    }
-                                                    match try_gas().await {
-                                                        Ok(v) => v,
-                                                        Err(e2) => {
-                                                            if this.has_cloud {
-                                                                try_cloud().await?
-                                                            } else {
-                                                                return Err(e2);
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
+                                        try_free().await?
+                                    }
+                                }
+                            }
+                        },
+                        Provider::Free => match try_free().await {
+                            Ok(v) => v,
+                            Err(e1) => {
+                                if !is_likely_google_api_error(&e1) {
+                                    return Err(e1);
+                                }
+                                match try_gas().await {
+                                    Ok(v) => v,
+                                    Err(e2) => {
+                                        if this.has_cloud {
+                                            try_cloud().await?
+                                        } else {
+                                            return Err(e2);
                                         }
-                                        Provider::Gas => {
-                                            match try_gas().await {
-                                                Ok(v) => v,
-                                                Err(_e1) => {
-                                                    if this.has_cloud {
-                                                        match try_cloud().await {
-                                                            Ok(v) => v,
-                                                            Err(_e2) => { try_free().await? }
-                                                        }
-                                                    } else {
-                                                        try_free().await?
-                                                    }
-                                                }
-                                            }
+                                    }
+                                }
+                            }
+                        },
+                        Provider::Gas => match try_gas().await {
+                            Ok(v) => v,
+                            Err(_e1) => {
+                                if this.has_cloud {
+                                    match try_cloud().await {
+                                        Ok(v) => v,
+                                        Err(_e2) => try_free().await?,
+                                    }
+                                } else {
+                                    try_free().await?
+                                }
+                            }
+                        },
+                        Provider::DeepL => match try_deepl().await {
+                            Ok(v) => v,
+                            Err(_e1) => match try_gas().await {
+                                Ok(v) => v,
+                                Err(_e2) => {
+                                    if this.has_cloud {
+                                        match try_cloud().await {
+                                            Ok(v) => v,
+                                            Err(_e3) => try_free().await?,
                                         }
-                                        Provider::DeepL => {
-                                            match try_deepl().await {
+                                    } else {
+                                        try_free().await?
+                                    }
+                                }
+                            },
+                        },
+                        Provider::ClaudeAi => match try_claude().await {
+                            Ok(v) => v,
+                            Err(_e1) => match try_gas().await {
+                                Ok(v) => v,
+                                Err(_e2) => {
+                                    if this.has_cloud {
+                                        match try_cloud().await {
+                                            Ok(v) => v,
+                                            Err(_e3) => match try_deepl().await {
                                                 Ok(v) => v,
-                                                Err(_e1) => {
-                                                    match try_gas().await {
-                                                        Ok(v) => v,
-                                                        Err(_e2) => {
-                                                            if this.has_cloud {
-                                                                match try_cloud().await {
-                                                                    Ok(v) => v,
-                                                                    Err(_e3) => { try_free().await? }
-                                                                }
-                                                            } else {
-                                                                try_free().await?
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
+                                                Err(_e4) => try_free().await?,
+                                            },
                                         }
-                                        Provider::ClaudeAi => {
-                                            match try_claude().await {
-                                                Ok(v) => v,
-                                                Err(_e1) => {
-                                                    match try_gas().await {
-                                                        Ok(v) => v,
-                                                        Err(_e2) => {
-                                                            if this.has_cloud {
-                                                                match try_cloud().await {
-                                                                    Ok(v) => v,
-                                                                    Err(_e3) => {
-                                                                        match try_deepl().await {
-                                                                            Ok(v) => v,
-                                                                            Err(_e4) => try_free().await?,
-                                                                        }
-                                                                    }
-                                                                }
-                                                            } else {
-                                                                match try_deepl().await {
-                                                                    Ok(v) => v,
-                                                                    Err(_e3) => try_free().await?,
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
+                                    } else {
+                                        match try_deepl().await {
+                                            Ok(v) => v,
+                                            Err(_e3) => try_free().await?,
                                         }
-                                    };
+                                    }
+                                }
+                            },
+                        },
+                    };
 
                     Ok::<_, TranslateError>(translated)
                 };
@@ -931,13 +1328,20 @@ impl Translator {
 
         let res = shared.await;
         if let Ok(ref translated) = res {
-            self.cache.lock().await.insert(text.clone(), translated.clone());
+            self.cache
+                .lock()
+                .await
+                .insert(text.clone(), translated.clone());
         }
         self.inflight.lock().await.remove(&text);
         res
     }
 
-    pub async fn translate_one(&self, text: &str, abort: &tokio_util::sync::CancellationToken) -> Result<String, TranslateError> {
+    pub async fn translate_one(
+        &self,
+        text: &str,
+        abort: &tokio_util::sync::CancellationToken,
+    ) -> Result<String, TranslateError> {
         if abort.is_cancelled() {
             return Err(TranslateError::Aborted);
         }
@@ -953,10 +1357,21 @@ impl Translator {
         let (protected, repls) = protect_placeholders(text);
         let t = self.translate_raw(protected, abort).await?;
         let restored = restore_placeholders(&t, &repls);
-        Ok(preserve_edge_whitespace(text, &restored))
+        let final_text = preserve_edge_whitespace(text, &restored);
+        if has_unresolved_mt_tokens(&final_text) {
+            // Never write unresolved placeholder tokens into output JSON.
+            // Keep the translated text, strip only the leftover tokens.
+            let stripped = strip_unresolved_mt_tokens(&final_text);
+            return Ok(preserve_edge_whitespace(text, &stripped));
+        }
+        Ok(final_text)
     }
 
-    pub async fn translate_many(&self, texts: &[String], abort: &tokio_util::sync::CancellationToken) -> Result<Vec<String>, TranslateError> {
+    pub async fn translate_many(
+        &self,
+        texts: &[String],
+        abort: &tokio_util::sync::CancellationToken,
+    ) -> Result<Vec<String>, TranslateError> {
         if abort.is_cancelled() {
             return Err(TranslateError::Aborted);
         }
@@ -976,10 +1391,13 @@ impl Translator {
         let mut protected: Vec<String> = Vec::with_capacity(texts.len());
         let mut repls: Vec<Vec<(String, String)>> = Vec::with_capacity(texts.len());
         let mut formatting_only: Vec<bool> = Vec::with_capacity(texts.len());
-        for t in texts {
+        for (i, t) in texts.iter().enumerate() {
             let fmt = is_formatting_only(t);
             formatting_only.push(fmt);
-            let (p, r) = protect_placeholders(t);
+            // In batch mode, multiple items can contain identical tokens like __MT0__.
+            // Some models may renumber or confuse them, so we make token numbers unique per item.
+            let base = i.saturating_mul(1000);
+            let (p, r) = protect_placeholders_with_base(t, base);
             protected.push(p);
             repls.push(r);
         }
@@ -1027,13 +1445,23 @@ impl Translator {
             tokio::time::sleep(Duration::from_millis(60)).await;
 
             let translated_missing = with_retry(
-                || translate_claude_ai_openai_compat_batch(&missing_texts, &self.source_google, &self.target_google),
+                || {
+                    translate_claude_ai_openai_compat_batch(
+                        &missing_texts,
+                        &self.source_google,
+                        &self.target_google,
+                        &self.claude_base_url,
+                        &self.claude_models,
+                    )
+                },
                 "claude-ai-batch",
             )
             .await?;
 
             if translated_missing.len() != missing_indices.len() {
-                return Err(TranslateError::Request("Claude(AI) batch size mismatch (internal)".to_string()));
+                return Err(TranslateError::Request(
+                    "Claude(AI) batch size mismatch (internal)".to_string(),
+                ));
             }
 
             for (pos, idx) in missing_indices.iter().cloned().enumerate() {
@@ -1054,7 +1482,13 @@ impl Translator {
         for i in 0..texts.len() {
             let translated = out[i].clone().unwrap_or_else(|| protected[i].clone());
             let restored = restore_placeholders(&translated, &repls[i]);
-            final_out.push(preserve_edge_whitespace(&texts[i], &restored));
+            let final_text = preserve_edge_whitespace(&texts[i], &restored);
+            if has_unresolved_mt_tokens(&final_text) {
+                let stripped = strip_unresolved_mt_tokens(&final_text);
+                final_out.push(preserve_edge_whitespace(&texts[i], &stripped));
+            } else {
+                final_out.push(final_text);
+            }
         }
         Ok(final_out)
     }

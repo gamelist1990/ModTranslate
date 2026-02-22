@@ -10,6 +10,8 @@ pub struct UiConfig {
     pub google_api_key: Option<String>,
     pub deepl_api_key: Option<String>,
     pub concurrency: Option<u32>,
+    pub claude_base_url: Option<String>,
+    pub claude_models: Option<String>,
 }
 
 fn config_path() -> Option<PathBuf> {

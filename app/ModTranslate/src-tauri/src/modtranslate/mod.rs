@@ -44,6 +44,8 @@ pub struct TranslateConfig {
     pub google_api_key: Option<String>,
     pub deepl_api_key: Option<String>,
     pub concurrency: Option<u32>,
+    pub claude_base_url: Option<String>,
+    pub claude_models: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
