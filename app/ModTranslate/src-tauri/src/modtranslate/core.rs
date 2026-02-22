@@ -9,7 +9,7 @@ use serde_json::{Map, Value};
 use tauri::{AppHandle, Emitter};
 use tokio_util::sync::CancellationToken;
 
-use futures::stream::{FuturesUnordered, StreamExt};
+use futures::{future::BoxFuture, stream::{FuturesUnordered, StreamExt}, FutureExt};
 
 use super::{
     jsonc::{parse_jsonc_object, try_parse_jsonc_object},
@@ -43,6 +43,24 @@ pub fn normalize_mc_lang_file_stem(input: &str) -> String {
         }
     }
     s.to_lowercase()
+}
+
+fn looks_like_human_text(s: &str) -> bool {
+    let core = s.trim();
+    if core.is_empty() {
+        return false;
+    }
+
+    if !core.chars().any(|c| c.is_alphabetic()) {
+        return false;
+    }
+
+    // Very short ALL-CAPS tokens are often fine to keep as-is (OK, UI, CPU, etc.)
+    if core.len() <= 3 && core.chars().all(|c| c.is_ascii_alphabetic() && c.is_ascii_uppercase()) {
+        return false;
+    }
+
+    true
 }
 
 pub fn list_jar_files(dir: &str) -> Result<Vec<JarFile>, CoreError> {
@@ -477,18 +495,34 @@ pub async fn run_translate(app: AppHandle, run_id: String, req: RunRequest, abor
             let mut string_keys: Vec<String> = Vec::new();
             let mut string_values: Vec<String> = Vec::new();
             let mut missing_key = false;
+            let mut total_source_strings: usize = 0;
+            let mut reused_strings: usize = 0;
 
             for (k, v) in data.iter() {
                 match v {
                     Value::String(s) => {
+                        total_source_strings += 1;
                         if let Some(ref existing) = existing_target {
                             if !existing.contains_key(k) {
                                 missing_key = true;
                             }
                             if let Some(Value::String(es)) = existing.get(k) {
-                                if !es.trim().is_empty() && es != s {
-                                    translated.insert(k.clone(), Value::String(es.clone()));
-                                    continue;
+                                if !es.trim().is_empty() {
+                                    // If existing == source, it may be either "not translated" or "translation legitimately equals source".
+                                    // Retranslate only when it looks like human text AND source/target language differ.
+                                    if es == s {
+                                        if req.source != req.target && looks_like_human_text(s) {
+                                            // retranslate
+                                        } else {
+                                            translated.insert(k.clone(), Value::String(es.clone()));
+                                            reused_strings += 1;
+                                            continue;
+                                        }
+                                    } else {
+                                        translated.insert(k.clone(), Value::String(es.clone()));
+                                        reused_strings += 1;
+                                        continue;
+                                    }
                                 }
                             }
                         }
@@ -533,10 +567,18 @@ pub async fn run_translate(app: AppHandle, run_id: String, req: RunRequest, abor
             }
 
             if !string_values.is_empty() {
-                let total_strings = string_keys.len();
-                let existing_count = total_strings.saturating_sub(string_values.len());
                 let note = if existing_target.is_some() {
-                    format!("差分翻訳 {}件（既存 {}件 再利用）", string_values.len(), existing_count)
+                    if reused_strings > 0 {
+                        format!(
+                            "差分翻訳 {}件（既存 {}件 再利用 / 合計 {}件）",
+                            string_values.len(),
+                            reused_strings,
+                            total_source_strings
+                        )
+                    } else {
+                        // 既存ファイルはあるが、今回再利用できる翻訳が無い（=実質フル翻訳）
+                        format!("翻訳 {}件（既存再利用なし / 合計 {}件）", string_values.len(), total_source_strings)
+                    }
                 } else {
                     format!("翻訳 {}件", string_values.len())
                 };
@@ -560,38 +602,113 @@ pub async fn run_translate(app: AppHandle, run_id: String, req: RunRequest, abor
                 let total = string_values.len();
                 let mut results: Vec<Option<String>> = vec![None; total];
 
-                let mut futs: FuturesUnordered<_> = FuturesUnordered::new();
-                for (idx, v) in string_values.iter().cloned().enumerate() {
-                    let translator2 = translator.clone();
-                    let abort2 = abort.clone();
-                    futs.push(async move {
-                        let res = translator2.translate_one(&v, &abort2).await;
-                        (idx, v, res)
-                    });
+                let is_claude = translator.provider_label() == "claude-ai";
+                let mut futs: FuturesUnordered<BoxFuture<'static, (Vec<usize>, Vec<String>, Result<Vec<String>, TranslateError>)>> = FuturesUnordered::new();
+                if is_claude {
+                    let max_items = translator.max_concurrency().max(1);
+                    let max_chars: usize = 12_000;
+
+                    let mut start: usize = 0;
+                    while start < string_values.len() {
+                        let mut end = start;
+                        let mut chars = 0usize;
+                        while end < string_values.len() {
+                            let s = &string_values[end];
+                            let next_chars = chars + s.len();
+                            if (end - start) >= max_items || next_chars > max_chars {
+                                break;
+                            }
+                            chars = next_chars;
+                            end += 1;
+                        }
+                        if end == start {
+                            end = (start + 1).min(string_values.len());
+                        }
+
+                        let batch_indices: Vec<usize> = (start..end).collect();
+                        let batch_texts: Vec<String> = string_values[start..end].to_vec();
+
+                        let translator2 = translator.clone();
+                        let abort2 = abort.clone();
+                        futs.push(
+                            async move {
+                                let res = translator2.translate_many(&batch_texts, &abort2).await;
+                                (batch_indices, batch_texts, res)
+                            }
+                            .boxed(),
+                        );
+
+                        start = end;
+                    }
+                } else {
+                    for (idx, v) in string_values.iter().cloned().enumerate() {
+                        let translator2 = translator.clone();
+                        let abort2 = abort.clone();
+                        futs.push(
+                            async move {
+                                let res = translator2.translate_one(&v, &abort2).await;
+                                (vec![idx], vec![v], res.map(|v| vec![v]))
+                            }
+                            .boxed(),
+                        );
+                    }
                 }
 
                 let mut done = 0usize;
-                while let Some((idx, original, res)) = futs.next().await {
-                    done += 1;
-                    let translated_text = match res {
-                        Ok(t) => t,
+                while let Some((indices, originals, res)) = futs.next().await {
+                    let batch_len = indices.len().max(1);
+                    done += batch_len;
+
+                    let translated_vec: Vec<String> = match res {
+                        Ok(vs) => vs,
                         Err(TranslateError::Aborted) => {
                             abort.cancel();
-                            original
+                            originals.clone()
                         }
                         Err(e) => {
                             let _ = app.emit(
                                 "modtranslate:log",
                                 LogEvent {
                                     run_id: run_id.clone(),
-                                    line: format!("WARN translate error: {}", e),
+                                    line: format!("WARN batch translate error: {}", e),
                                 },
                             );
-                            original
+
+                            // Fallback: per-item translation (more tolerant) when batch JSON fails.
+                            let mut out: Vec<String> = Vec::with_capacity(originals.len());
+                            for s in originals.iter() {
+                                if abort.is_cancelled() {
+                                    out.push(s.clone());
+                                    continue;
+                                }
+                                match translator.translate_one(s, &abort).await {
+                                    Ok(t) => out.push(t),
+                                    Err(TranslateError::Aborted) => {
+                                        abort.cancel();
+                                        out.push(s.clone());
+                                    }
+                                    Err(e2) => {
+                                        let _ = app.emit(
+                                            "modtranslate:log",
+                                            LogEvent {
+                                                run_id: run_id.clone(),
+                                                line: format!("WARN translate error: {}", e2),
+                                            },
+                                        );
+                                        out.push(s.clone());
+                                    }
+                                }
+                            }
+                            out
                         }
                     };
-                    if idx < results.len() {
-                        results[idx] = Some(translated_text);
+
+                    for (pos, idx) in indices.iter().cloned().enumerate() {
+                        let original = originals.get(pos).cloned().unwrap_or_default();
+                        let translated_text = translated_vec.get(pos).cloned().unwrap_or(original);
+                        if idx < results.len() {
+                            results[idx] = Some(translated_text);
+                        }
                     }
 
                     let _ = app.emit(

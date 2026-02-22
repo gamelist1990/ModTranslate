@@ -36,7 +36,7 @@ function App() {
   const [repairBrokenTargetInJar, setRepairBrokenTargetInJar] = useState(false);
   const [backupJars, setBackupJars] = useState(true);
 
-  const [provider, setProvider] = useState<"auto" | "free" | "google-cloud" | "gas" | "deepl">("auto");
+  const [provider, setProvider] = useState<"auto" | "free" | "google-cloud" | "gas" | "deepl" | "claude-ai">("auto");
   const [googleApiKey, setGoogleApiKey] = useState<string>("");
   const [deeplApiKey, setDeeplApiKey] = useState<string>("");
   const [concurrency, setConcurrency] = useState<number>(0);
@@ -47,7 +47,7 @@ function App() {
         const res = await invoke<any>("load_config");
         if (res) {
           const p = res.provider;
-          if (p === "auto" || p === "free" || p === "google-cloud" || p === "gas" || p === "deepl") setProvider(p);
+          if (p === "auto" || p === "free" || p === "google-cloud" || p === "gas" || p === "deepl" || p === "claude-ai") setProvider(p);
           if (typeof res.googleApiKey === "string") setGoogleApiKey(res.googleApiKey);
           if (typeof res.deeplApiKey === "string") setDeeplApiKey(res.deeplApiKey);
           if (typeof res.concurrency === "number") setConcurrency(res.concurrency);

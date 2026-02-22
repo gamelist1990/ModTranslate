@@ -17,6 +17,7 @@ pub enum Provider {
     GoogleCloud,
     Gas,
     DeepL,
+    ClaudeAi,
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -33,6 +34,24 @@ pub enum TranslateError {
     MissingDeepLKey,
     #[error("Aborted")]
     Aborted,
+}
+
+const CLAUDE_OPENAI_COMPAT_BASE_URL: &str = "https://capi.voids.top/v2/";
+const CLAUDE_OPENAI_COMPAT_API_KEY: &str = "yajuu_no_kokoro_no_naka_ni_aru_sa_www";
+const CLAUDE_OPENAI_COMPAT_MODELS: [&str; 4] = [
+    "claude-opus-4-5",
+    "claude-haiku-4-5-20251001",
+    "claude-haiku-4.5",
+    "claude-sonnet-4.5",
+];
+
+fn extract_json_array_str(s: &str) -> Option<&str> {
+    let start = s.find('[')?;
+    let end = s.rfind(']')?;
+    if end <= start {
+        return None;
+    }
+    Some(&s[start..=end])
 }
 
 fn clamp_u32(v: Option<u32>, min: u32, max: u32, fallback: u32) -> u32 {
@@ -336,6 +355,244 @@ async fn translate_deepl(text: &str, source: &str, target: &str, api_key: &str) 
     Ok(translated)
 }
 
+async fn translate_claude_ai_openai_compat(text: &str, source: &str, target: &str) -> Result<String, TranslateError> {
+    let base = reqwest::Url::parse(CLAUDE_OPENAI_COMPAT_BASE_URL).map_err(|e| TranslateError::Request(e.to_string()))?;
+    let url = base
+        .join("chat/completions")
+        .map_err(|e| TranslateError::Request(e.to_string()))?;
+
+    let client = reqwest::Client::new();
+
+    let system = format!(
+        "You are a translation engine. Translate from {source} to {target}. \
+Return ONLY the translated text (no quotes, no markdown). \
+Do NOT alter tokens like __MT0__ or __MT12__. Preserve them exactly.",
+        source = source,
+        target = target
+    );
+
+    let mut last_err: Option<TranslateError> = None;
+
+    for model in CLAUDE_OPENAI_COMPAT_MODELS {
+        let res = match client
+            .post(url.clone())
+            .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", CLAUDE_OPENAI_COMPAT_API_KEY))
+            .json(&serde_json::json!({
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system.clone()},
+                    {"role": "user", "content": text},
+                ],
+                "temperature": 0,
+                "stream": false,
+            }))
+            .timeout(Duration::from_secs(40))
+            .send()
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                last_err = Some(TranslateError::Request(e.to_string()));
+                continue;
+            }
+        };
+
+        if !res.status().is_success() {
+            let status_code = res.status().as_u16();
+            let status_text = res.status().to_string();
+            let msg = res.text().await.unwrap_or(status_text);
+            last_err = Some(TranslateError::Http {
+                status: status_code,
+                message: msg,
+            });
+            continue;
+        }
+
+        let data: serde_json::Value = match res.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                last_err = Some(TranslateError::Request(e.to_string()));
+                continue;
+            }
+        };
+
+        let content_val = data
+            .get("choices")
+            .and_then(|v| v.get(0))
+            .and_then(|v| v.get("message"))
+            .and_then(|v| v.get("content"));
+
+        let content = match content_val {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(serde_json::Value::Array(parts)) => {
+                // Some OpenAI-compatible servers return: content: [{type:"text", text:"..."}, ...]
+                let mut out = String::new();
+                for p in parts {
+                    if let Some(t) = p.get("text").and_then(|v| v.as_str()) {
+                        out.push_str(t);
+                    }
+                }
+                out
+            }
+            _ => "".to_string(),
+        };
+
+        let content = content.trim().to_string();
+        if content.is_empty() {
+            last_err = Some(TranslateError::Request(format!("Claude(AI) returned empty content for model: {}", model)));
+            continue;
+        }
+
+        return Ok(content);
+    }
+
+    Err(last_err.unwrap_or_else(|| TranslateError::Request("Claude(AI) request failed".to_string())))
+}
+
+async fn translate_claude_ai_openai_compat_batch(texts: &[String], source: &str, target: &str) -> Result<Vec<String>, TranslateError> {
+    let base = reqwest::Url::parse(CLAUDE_OPENAI_COMPAT_BASE_URL).map_err(|e| TranslateError::Request(e.to_string()))?;
+    let url = base
+        .join("chat/completions")
+        .map_err(|e| TranslateError::Request(e.to_string()))?;
+
+    let client = reqwest::Client::new();
+
+    let system = format!(
+        "You are a translation engine. Translate each item from {source} to {target}.\n\n\
+STRICT OUTPUT FORMAT (MUST FOLLOW):\n\
+- Output MUST be ONLY a valid JSON array of strings.\n\
+- The array length MUST equal the input length, and order MUST match input order.\n\
+- Do NOT wrap in markdown/code fences. Do NOT add explanations.\n\
+- Output MUST start with '[' and end with ']'.\n\
+- Do NOT alter tokens like __MT0__ or __MT12__. Preserve them exactly.\n\n\
+EXAMPLE:\n\
+Input: [\"Hello __MT0__\", \"Bye\"]\n\
+Output: [\"こんにちは __MT0__\", \"さようなら\"]\n",
+        source = source,
+        target = target
+    );
+
+    let user_payload = serde_json::to_string(texts).map_err(|e| TranslateError::Request(e.to_string()))?;
+
+    let mut last_err: Option<TranslateError> = None;
+    for model in CLAUDE_OPENAI_COMPAT_MODELS {
+        let res = match client
+            .post(url.clone())
+            .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", CLAUDE_OPENAI_COMPAT_API_KEY))
+            .json(&serde_json::json!({
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system.clone()},
+                    {"role": "user", "content": user_payload.clone()},
+                ],
+                "temperature": 0,
+                "stream": false,
+            }))
+            .timeout(Duration::from_secs(80))
+            .send()
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                last_err = Some(TranslateError::Request(e.to_string()));
+                continue;
+            }
+        };
+
+        if !res.status().is_success() {
+            let status_code = res.status().as_u16();
+            let status_text = res.status().to_string();
+            let msg = res.text().await.unwrap_or(status_text);
+            last_err = Some(TranslateError::Http {
+                status: status_code,
+                message: msg,
+            });
+            continue;
+        }
+
+        let data: serde_json::Value = match res.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                last_err = Some(TranslateError::Request(e.to_string()));
+                continue;
+            }
+        };
+
+        let content_val = data
+            .get("choices")
+            .and_then(|v| v.get(0))
+            .and_then(|v| v.get("message"))
+            .and_then(|v| v.get("content"));
+
+        let content = match content_val {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(serde_json::Value::Array(parts)) => {
+                let mut out = String::new();
+                for p in parts {
+                    if let Some(t) = p.get("text").and_then(|v| v.as_str()) {
+                        out.push_str(t);
+                    }
+                }
+                out
+            }
+            _ => "".to_string(),
+        };
+
+        let content_trim = content.trim();
+        if content_trim.is_empty() {
+            last_err = Some(TranslateError::Request(format!("Claude(AI) returned empty content for model: {}", model)));
+            continue;
+        }
+
+        let json_str = match serde_json::from_str::<serde_json::Value>(content_trim) {
+            Ok(v) => {
+                // already valid JSON; re-serialize for uniform parsing below
+                serde_json::to_string(&v).unwrap_or_else(|_| content_trim.to_string())
+            }
+            Err(_) => extract_json_array_str(content_trim).unwrap_or(content_trim).to_string(),
+        };
+
+        let arr: Vec<String> = match serde_json::from_str::<serde_json::Value>(&json_str)
+            .ok()
+            .and_then(|v| v.as_array().cloned())
+        {
+            Some(a) => {
+                let mut out: Vec<String> = Vec::with_capacity(a.len());
+                let mut ok = true;
+                for it in a {
+                    if let Some(s) = it.as_str() {
+                        out.push(s.to_string());
+                    } else {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok { out } else { Vec::new() }
+            }
+            None => Vec::new(),
+        };
+
+        if arr.len() != texts.len() {
+            last_err = Some(TranslateError::Request(format!(
+                "Claude(AI) JSON length mismatch for model {}: expected {}, got {}",
+                model,
+                texts.len(),
+                arr.len()
+            )));
+            continue;
+        }
+
+        if arr.iter().any(|s| s.trim().is_empty()) {
+            last_err = Some(TranslateError::Request(format!("Claude(AI) returned empty string item for model: {}", model)));
+            continue;
+        }
+
+        return Ok(arr);
+    }
+
+    Err(last_err.unwrap_or_else(|| TranslateError::Request("Claude(AI) batch request failed".to_string())))
+}
+
 fn protect_placeholders(input: &str) -> (String, Vec<(String, String)>) {
     static PATTERNS: std::sync::OnceLock<Vec<Regex>> = std::sync::OnceLock::new();
     let patterns = PATTERNS.get_or_init(|| {
@@ -377,6 +634,54 @@ fn restore_placeholders(translated: &str, repls: &[(String, String)]) -> String 
     out
 }
 
+fn is_formatting_only(s: &str) -> bool {
+    let core = s.trim();
+    if core.is_empty() {
+        return true;
+    }
+
+    // If it's very short and contains no letters/digits, it's likely just formatting (arrows, bullets, etc.)
+    if core.len() <= 6 && core.chars().all(|c| !c.is_alphabetic() && !c.is_numeric()) {
+        return true;
+    }
+
+    false
+}
+
+fn edge_whitespace(s: &str) -> (&str, &str, &str) {
+    let bytes = s.as_bytes();
+
+    let mut start = 0usize;
+    while start < bytes.len() {
+        let ch = s[start..].chars().next().unwrap();
+        if !(ch == ' ' || ch == '\t') {
+            break;
+        }
+        start += ch.len_utf8();
+    }
+
+    let mut end = s.len();
+    while end > start {
+        let ch = s[..end].chars().next_back().unwrap();
+        if !(ch == ' ' || ch == '\t') {
+            break;
+        }
+        end -= ch.len_utf8();
+    }
+
+    (&s[..start], &s[start..end], &s[end..])
+}
+
+fn preserve_edge_whitespace(original: &str, translated: &str) -> String {
+    let (opre, _, osuf) = edge_whitespace(original);
+    if opre.is_empty() && osuf.is_empty() {
+        return translated.to_string();
+    }
+
+    let (_, core, _) = edge_whitespace(translated);
+    format!("{}{}{}", opre, core, osuf)
+}
+
 #[derive(Clone)]
 pub struct Translator {
     source_google: String,
@@ -389,6 +694,7 @@ pub struct Translator {
     deepl_api_key: Option<String>,
     gas_url: String,
     semaphore: Arc<Semaphore>,
+    concurrency: usize,
     cache: Arc<Mutex<HashMap<String, String>>>,
     inflight: Arc<Mutex<HashMap<String, futures::future::Shared<BoxFuture<'static, Result<String, TranslateError>>>>>>,
 }
@@ -400,6 +706,7 @@ impl Translator {
             Provider::Gas => "gas",
             Provider::DeepL => "deepl",
             Provider::Free => "free",
+            Provider::ClaudeAi => "claude-ai",
         }
     }
 
@@ -428,6 +735,7 @@ impl Translator {
             Some("gas") => Provider::Gas,
             Some("deepl") => Provider::DeepL,
             Some("free") => Provider::Free,
+            Some("claude-ai") | Some("claude") | Some("claude(ai)") => Provider::ClaudeAi,
             // auto
             _ => {
                 if has_cloud {
@@ -454,9 +762,14 @@ impl Translator {
             deepl_api_key,
             gas_url,
             semaphore: Arc::new(Semaphore::new(concurrency as usize)),
+            concurrency: concurrency as usize,
             cache: Arc::new(Mutex::new(HashMap::new())),
             inflight: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub fn max_concurrency(&self) -> usize {
+        self.concurrency
     }
 
     async fn translate_raw(&self, text: String, abort: &tokio_util::sync::CancellationToken) -> Result<String, TranslateError> {
@@ -500,6 +813,7 @@ impl Translator {
                         let key = this.deepl_api_key.as_deref().ok_or(TranslateError::MissingDeepLKey)?;
                         with_retry(|| translate_deepl(&t, &this.source_deepl, &this.target_deepl, key), "deepl").await
                     };
+                    let try_claude = || with_retry(|| translate_claude_ai_openai_compat(&t, &this.source_google, &this.target_google), "claude-ai");
                                     // Decide sequence based on selected primary provider
                                     let translated = match this.provider_primary {
                                         Provider::GoogleCloud => {
@@ -576,6 +890,34 @@ impl Translator {
                                                 }
                                             }
                                         }
+                                        Provider::ClaudeAi => {
+                                            match try_claude().await {
+                                                Ok(v) => v,
+                                                Err(_e1) => {
+                                                    match try_gas().await {
+                                                        Ok(v) => v,
+                                                        Err(_e2) => {
+                                                            if this.has_cloud {
+                                                                match try_cloud().await {
+                                                                    Ok(v) => v,
+                                                                    Err(_e3) => {
+                                                                        match try_deepl().await {
+                                                                            Ok(v) => v,
+                                                                            Err(_e4) => try_free().await?,
+                                                                        }
+                                                                    }
+                                                                }
+                                                            } else {
+                                                                match try_deepl().await {
+                                                                    Ok(v) => v,
+                                                                    Err(_e3) => try_free().await?,
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
                                     };
 
                     Ok::<_, TranslateError>(translated)
@@ -603,8 +945,117 @@ impl Translator {
             return Ok(text.to_string());
         }
 
+        // Keep formatting-only entries (padding, arrows, symbols) untouched.
+        if is_formatting_only(text) {
+            return Ok(text.to_string());
+        }
+
         let (protected, repls) = protect_placeholders(text);
         let t = self.translate_raw(protected, abort).await?;
-        Ok(restore_placeholders(&t, &repls))
+        let restored = restore_placeholders(&t, &repls);
+        Ok(preserve_edge_whitespace(text, &restored))
+    }
+
+    pub async fn translate_many(&self, texts: &[String], abort: &tokio_util::sync::CancellationToken) -> Result<Vec<String>, TranslateError> {
+        if abort.is_cancelled() {
+            return Err(TranslateError::Aborted);
+        }
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        if self.provider_primary != Provider::ClaudeAi {
+            let mut out: Vec<String> = Vec::with_capacity(texts.len());
+            for t in texts {
+                out.push(self.translate_one(t, abort).await?);
+            }
+            return Ok(out);
+        }
+
+        // Placeholder protection per item
+        let mut protected: Vec<String> = Vec::with_capacity(texts.len());
+        let mut repls: Vec<Vec<(String, String)>> = Vec::with_capacity(texts.len());
+        let mut formatting_only: Vec<bool> = Vec::with_capacity(texts.len());
+        for t in texts {
+            let fmt = is_formatting_only(t);
+            formatting_only.push(fmt);
+            let (p, r) = protect_placeholders(t);
+            protected.push(p);
+            repls.push(r);
+        }
+
+        // Fast-path from cache
+        let mut out: Vec<Option<String>> = vec![None; protected.len()];
+
+        // formatting-only items are returned as-is (do not hit network)
+        for (i, is_fmt) in formatting_only.iter().copied().enumerate() {
+            if is_fmt {
+                out[i] = Some(texts[i].clone());
+            }
+        }
+
+        {
+            let cache = self.cache.lock().await;
+            for (i, p) in protected.iter().enumerate() {
+                if out[i].is_some() {
+                    continue;
+                }
+                if let Some(v) = cache.get(p) {
+                    out[i] = Some(v.clone());
+                }
+            }
+        }
+
+        let mut missing_texts: Vec<String> = Vec::new();
+        let mut missing_indices: Vec<usize> = Vec::new();
+        for (i, p) in protected.iter().enumerate() {
+            if out[i].is_none() {
+                missing_indices.push(i);
+                missing_texts.push(p.clone());
+            }
+        }
+
+        if !missing_texts.is_empty() {
+            let _permit = self
+                .semaphore
+                .acquire()
+                .await
+                .map_err(|_| TranslateError::Request("semaphore closed".to_string()))?;
+            if abort.is_cancelled() {
+                return Err(TranslateError::Aborted);
+            }
+            tokio::time::sleep(Duration::from_millis(60)).await;
+
+            let translated_missing = with_retry(
+                || translate_claude_ai_openai_compat_batch(&missing_texts, &self.source_google, &self.target_google),
+                "claude-ai-batch",
+            )
+            .await?;
+
+            if translated_missing.len() != missing_indices.len() {
+                return Err(TranslateError::Request("Claude(AI) batch size mismatch (internal)".to_string()));
+            }
+
+            for (pos, idx) in missing_indices.iter().cloned().enumerate() {
+                out[idx] = Some(translated_missing[pos].clone());
+            }
+
+            // write-through cache for protected strings
+            let mut cache = self.cache.lock().await;
+            for (i, v) in out.iter().enumerate() {
+                if let Some(s) = v {
+                    cache.insert(protected[i].clone(), s.clone());
+                }
+            }
+        }
+
+        // Restore placeholders and preserve edge whitespace
+        let mut final_out: Vec<String> = Vec::with_capacity(texts.len());
+        for i in 0..texts.len() {
+            let translated = out[i].clone().unwrap_or_else(|| protected[i].clone());
+            let restored = restore_placeholders(&translated, &repls[i]);
+            final_out.push(preserve_edge_whitespace(&texts[i], &restored));
+        }
+        Ok(final_out)
     }
 }
