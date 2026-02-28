@@ -301,8 +301,15 @@ fn is_retryable_status(status: u16) -> bool {
 
 fn is_retryable_message(msg: &str) -> bool {
     let m = msg.to_lowercase();
+    // Expand retryable substrings to cover common reqwest/transport errors
     [
         "fetch failed",
+        "error sending request",
+        "error trying to connect",
+        "failed to connect",
+        "connection refused",
+        "connection reset",
+        "connection timed out",
         "econnreset",
         "etimedout",
         "timeout",
@@ -311,6 +318,11 @@ fn is_retryable_message(msg: &str) -> bool {
         "aborted",
         "socket",
         "dns",
+        "could not resolve",
+        "name or service not known",
+        "tls",
+        "certificate",
+        "ssl",
         "503",
         "502",
         "500",
@@ -447,9 +459,13 @@ async fn translate_google_cloud(
         .map_err(|e| TranslateError::Request(e.to_string()))?;
 
     if !res.status().is_success() {
+        let status_code = res.status().as_u16();
+        let status_text = res.status().to_string();
+        // Try to include response body for better diagnostics (may be empty on some errors)
+        let msg = res.text().await.unwrap_or_else(|_| status_text.clone());
         return Err(TranslateError::Http {
-            status: res.status().as_u16(),
-            message: res.status().to_string(),
+            status: status_code,
+            message: msg,
         });
     }
 
